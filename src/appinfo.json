@@ -1,0 +1,30 @@
+{
+  "id": "org.webosbrew.vkvideo.adfree",
+  "version": "1.0.0",
+  "vendor": "webosbrew.org",
+  "type": "web",
+  "main": "index.html",
+  "title": "VK Video AdFree 4K",
+  "icon": "assets/icon.png",
+  "largeIcon": "assets/largeIcon.png",
+  "extraLargeIcon": "assets/extraLargeIcon.png",
+  "splashBackground": "assets/splashBackground.png",
+  "bgColor": "#0B0E14",
+  "iconColor": "#0077FF",
+  "resolution": "1920x1080",
+  "requiredPermissions": [
+    "all"
+  ],
+  "permissions": "all",
+  "privilegedJail": true,
+  "allowCrossDomain": true,
+  "disableBackHistoryAPI": true,
+  "supportQuickStart": true,
+  "enablePigScreenSaver": false,
+  "accessibility": {
+    "supportsAudioGuidance": false
+  },
+  "vendorExtension": {
+    "allowCrossDomain": true
+  }
+}

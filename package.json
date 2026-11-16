@@ -1,0 +1,10 @@
+{
+  "name": "vkvideo-adfree",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Ultra-fast 4K AdFree VK Video Client for LG webOS TV",
+  "scripts": {
+    "test": "node --test tests/*.mjs",
+    "build": "python pack_ipk.py"
+  }
+}

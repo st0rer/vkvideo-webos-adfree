@@ -1,0 +1,2270 @@
+/**
+ * VK Video AdFree 4K - Main Application Logic
+ */
+
+class VKVideoApp {
+  constructor() {
+    this.api = new (window.VKApi || VKApi)();
+    this.currentSection = 'home';
+    this.keyboardLang = 'ru';
+    this.searchQuery = '';
+    this.qrPollTimer = null;
+    this.activeDeviceAuth = null;
+    this.videoMap = {};
+    this.currentChannel = null;
+    this.userSubscribedIds = new Set();
+
+    // Accounts & Multi-User system
+    this.accounts = [];
+    this.activeUserId = null;
+    this.history = [];
+    this.favorites = [];
+    this.watchProgress = {};
+    this.initAccounts();
+
+    // In-memory cache for instantaneous tab switching (0 ms) & SWR
+    this.homeFeedCache = null;
+    this.homeFeedCacheTime = 0;
+    this.subsFeedCache = null;
+    this.subsChannelsCache = null;
+    this.subsCacheTime = 0;
+
+    // Subsystems
+    this.player = new (window.VideoPlayer || VideoPlayer)(this);
+    this.nav = new (window.SpatialNavigation || SpatialNavigation)(this);
+    this.thumbnailObserver = null;
+    this.initThumbnailObserver();
+
+    this.initDOM();
+    this.initLifecycle();
+    this.initKeyboard();
+    this.updateUserCard();
+    this.verifyUserAuth();
+    this.loadSection('home');
+  }
+
+  initAccounts() {
+    this.accounts = [];
+    try {
+      const raw = localStorage.getItem('vk_user_accounts');
+      if (raw) this.accounts = JSON.parse(raw);
+    } catch (e) {}
+
+    // Auto-migrate legacy single user if present
+    const existingToken = localStorage.getItem('vk_user_token');
+    const existingInfo = JSON.parse(localStorage.getItem('vk_user_info') || '{}');
+    if (existingToken && (!this.accounts || this.accounts.length === 0)) {
+      const migratedAcc = {
+        id: existingInfo.id || 'default_user',
+        name: existingInfo.name || 'Пользователь VK',
+        photo: existingInfo.photo || null,
+        token: existingToken,
+        addedAt: Date.now()
+      };
+      this.accounts = [migratedAcc];
+      try {
+        localStorage.setItem('vk_user_accounts', JSON.stringify(this.accounts));
+        localStorage.setItem('vk_active_user_id', String(migratedAcc.id));
+      } catch (e) {}
+    }
+
+    let activeId = localStorage.getItem('vk_active_user_id');
+    let activeAcc = this.accounts.find(a => String(a.id) === String(activeId));
+    if (!activeAcc && this.accounts.length > 0) {
+      activeAcc = this.accounts[0];
+      activeId = activeAcc.id;
+      try {
+        localStorage.setItem('vk_active_user_id', String(activeId));
+      } catch (e) {}
+    }
+
+    if (activeAcc) {
+      this.activeUserId = activeAcc.id;
+      this.api.setToken(activeAcc.token);
+      try {
+        localStorage.setItem('vk_user_info', JSON.stringify(activeAcc));
+      } catch (e) {}
+      this.loadUserScopedData(activeAcc.id);
+    } else {
+      this.activeUserId = null;
+      try {
+        this.history = JSON.parse(localStorage.getItem('vk_history_guest') || localStorage.getItem('vk_history') || '[]');
+        this.favorites = JSON.parse(localStorage.getItem('vk_favorites_guest') || localStorage.getItem('vk_favorites') || '[]');
+        this.watchProgress = JSON.parse(localStorage.getItem('vk_watch_progress_guest') || localStorage.getItem('vk_watch_progress') || '{}');
+      } catch (e) {
+        this.history = [];
+        this.favorites = [];
+        this.watchProgress = {};
+      }
+    }
+  }
+
+  saveUserScopedData(key, data) {
+    const activeId = this.activeUserId;
+    if (activeId) {
+      try {
+        localStorage.setItem(`vk_${key}_${activeId}`, JSON.stringify(data));
+      } catch (e) {}
+    } else {
+      try {
+        localStorage.setItem(`vk_${key}_guest`, JSON.stringify(data));
+        localStorage.setItem(`vk_${key}`, JSON.stringify(data));
+      } catch (e) {}
+    }
+  }
+
+  loadUserScopedData(userId) {
+    // Only migrate from legacy un-scoped storage once, for the very first primary account
+    const isFirstAccount = this.accounts.length > 0 && String(userId) === String(this.accounts[0].id);
+    let alreadyMigrated = false;
+    try {
+      alreadyMigrated = localStorage.getItem('vk_legacy_scoped_migrated') === 'true';
+    } catch (e) {}
+
+    // 1. History
+    let hist = [];
+    try {
+      const scopedHist = localStorage.getItem(`vk_history_${userId}`);
+      if (scopedHist) {
+        hist = JSON.parse(scopedHist);
+      } else if (isFirstAccount && !alreadyMigrated) {
+        const legacyHist = localStorage.getItem('vk_history');
+        if (legacyHist) {
+          hist = JSON.parse(legacyHist);
+          localStorage.setItem(`vk_history_${userId}`, legacyHist);
+        }
+      }
+    } catch (e) {}
+    this.history = hist;
+
+    // 2. Favorites
+    let favs = [];
+    try {
+      const scopedFavs = localStorage.getItem(`vk_favorites_${userId}`);
+      if (scopedFavs) {
+        favs = JSON.parse(scopedFavs);
+      } else if (isFirstAccount && !alreadyMigrated) {
+        const legacyFavs = localStorage.getItem('vk_favorites');
+        if (legacyFavs) {
+          favs = JSON.parse(legacyFavs);
+          localStorage.setItem(`vk_favorites_${userId}`, legacyFavs);
+        }
+      }
+    } catch (e) {}
+    this.favorites = favs;
+
+    // 3. Watch Progress
+    let prog = {};
+    try {
+      const scopedProg = localStorage.getItem(`vk_watch_progress_${userId}`);
+      if (scopedProg) {
+        prog = JSON.parse(scopedProg);
+      } else if (isFirstAccount && !alreadyMigrated) {
+        const legacyProg = localStorage.getItem('vk_watch_progress');
+        if (legacyProg) {
+          prog = JSON.parse(legacyProg);
+          localStorage.setItem(`vk_watch_progress_${userId}`, legacyProg);
+        }
+      }
+    } catch (e) {}
+    this.watchProgress = prog;
+
+    if (isFirstAccount && !alreadyMigrated) {
+      try {
+        localStorage.setItem('vk_legacy_scoped_migrated', 'true');
+      } catch (e) {}
+    }
+
+    // 4. Invalidate feed caches
+    this.homeFeedCache = null;
+    this.homeFeedCacheTime = 0;
+    this.subsFeedCache = null;
+    this.subsChannelsCache = null;
+    this.subsCacheTime = 0;
+    this.userSubscribedIds = new Set();
+  }
+
+  async switchUser(userId) {
+    const acc = this.accounts.find(a => String(a.id) === String(userId));
+    if (!acc) return;
+
+    this.activeUserId = acc.id;
+    try {
+      localStorage.setItem('vk_active_user_id', String(acc.id));
+      localStorage.setItem('vk_user_token', acc.token);
+      localStorage.setItem('vk_user_info', JSON.stringify(acc));
+    } catch (e) {}
+
+    this.api.setToken(acc.token);
+    this.loadUserScopedData(acc.id);
+
+    this.updateUserCard();
+    this.closeAllModals();
+    this.showToast(`Профиль переключен: ${acc.name}`);
+
+    // Reload active view with fresh personalized recommendations & subscriptions
+    if (this.currentSection === 'home') {
+      this.renderHome();
+    } else {
+      this.loadSection(this.currentSection);
+    }
+  }
+
+  removeAccount(userId) {
+    const acc = this.accounts.find(a => String(a.id) === String(userId));
+    if (!acc) return;
+    if (!confirm(`Удалить профиль «${acc.name}» с этого телевизора?`)) return;
+
+    this.accounts = this.accounts.filter(a => String(a.id) !== String(userId));
+    try {
+      localStorage.setItem('vk_user_accounts', JSON.stringify(this.accounts));
+      localStorage.removeItem(`vk_history_${userId}`);
+      localStorage.removeItem(`vk_favorites_${userId}`);
+      localStorage.removeItem(`vk_watch_progress_${userId}`);
+      localStorage.removeItem(`vk_home_feed_cache_auth_v5_user_${userId}`);
+      localStorage.removeItem(`vk_subscriptions_feed_cache_auth_user_${userId}`);
+    } catch (e) {}
+
+    if (String(this.activeUserId) === String(userId)) {
+      if (this.accounts.length > 0) {
+        this.switchUser(this.accounts[0].id);
+      } else {
+        // No accounts left: full logout to guest
+        this.api.logout();
+        this.activeUserId = null;
+        try {
+          localStorage.removeItem('vk_active_user_id');
+        } catch (e) {}
+        this.history = [];
+        this.favorites = [];
+        this.watchProgress = {};
+        this.updateUserCard();
+        this.closeAllModals();
+        this.showToast('Вы вышли из профиля');
+        this.loadSection('home');
+        return;
+      }
+    }
+
+    this.renderProfilesList();
+  }
+
+  openProfilesModal() {
+    const modal = document.getElementById('profiles-modal');
+    if (!modal) return;
+    this.renderProfilesList();
+    modal.style.display = 'flex';
+
+    const addBtn = document.getElementById('btn-add-profile');
+    if (addBtn) {
+      addBtn.onclick = () => {
+        this.closeAllModals();
+        this.openQRModal(true); // force fresh QR code for adding new user
+      };
+    }
+    const closeBtn = document.getElementById('btn-close-profiles');
+    if (closeBtn) {
+      closeBtn.onclick = () => this.closeAllModals();
+    }
+
+    const firstFocus = modal.querySelector('.focusable');
+    if (firstFocus) this.nav.setFocus(firstFocus);
+  }
+
+  renderProfilesList() {
+    const container = document.getElementById('profiles-list');
+    if (!container) return;
+    container.innerHTML = '';
+
+    if (!this.accounts || this.accounts.length === 0) {
+      container.innerHTML = '<div style="color:var(--text-muted); padding:20px; font-size:18px;">Нет сохраненных профилей. Нажмите «Добавить пользователя».</div>';
+      return;
+    }
+
+    this.accounts.forEach(acc => {
+      const isActive = String(acc.id) === String(this.activeUserId);
+      const row = document.createElement('div');
+      row.className = `profile-item focusable ${isActive ? 'active-profile' : ''}`;
+      row.dataset.id = acc.id;
+
+      const avatarContent = acc.photo
+        ? `<img src="${acc.photo}" alt="${acc.name}">`
+        : `<span>${(acc.name || 'VK').slice(0, 2).toUpperCase()}</span>`;
+
+      row.innerHTML = `
+        <div class="profile-avatar-wrap">
+          ${avatarContent}
+        </div>
+        <div class="profile-details">
+          <div class="profile-name">${acc.name || 'Пользователь VK'}</div>
+          <div class="profile-subtext">${isActive ? '🟢 Текущий активный профиль' : 'Нажмите для переключения'}</div>
+        </div>
+        <div class="profile-actions">
+          ${!isActive ? `<button class="profile-action-btn focusable primary" data-action="switch" data-id="${acc.id}">Выбрать</button>` : ''}
+          <button class="profile-action-btn focusable danger" data-action="delete" data-id="${acc.id}">
+            ${isActive && this.accounts.length === 1 ? 'Выйти' : 'Удалить'}
+          </button>
+        </div>
+      `;
+
+      // Row click switches to profile if not active
+      row.addEventListener('click', (e) => {
+        if (e.target.closest('.profile-action-btn')) return;
+        if (!isActive) {
+          this.switchUser(acc.id);
+        }
+      });
+
+      // Action buttons
+      const switchBtn = row.querySelector('[data-action="switch"]');
+      if (switchBtn) {
+        switchBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          this.switchUser(acc.id);
+        });
+      }
+
+      const delBtn = row.querySelector('[data-action="delete"]');
+      if (delBtn) {
+        delBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          this.removeAccount(acc.id);
+        });
+      }
+
+      container.appendChild(row);
+    });
+  }
+
+  initLifecycle() {
+    // webOS App Lifecycle & Backgrounding
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        if (this.player && this.player.isPlaying) {
+          this.player.video.pause();
+          this.player.wasPlayingBeforeHidden = true;
+          this.player.stopPowerKeepAlive();
+        }
+      } else {
+        if (this.player && this.player.wasPlayingBeforeHidden) {
+          this.player.wakeOSD();
+          this.player.startPowerKeepAlive();
+        }
+      }
+    });
+
+    document.addEventListener('webOSRelaunch', (e) => {
+      console.log('[webOS] Relaunch triggered:', e.detail);
+      if (this.player && this.player.container.style.display !== 'none') {
+        this.player.wakeOSD();
+      }
+    });
+  }
+
+  saveWatchProgress(videoId, currentTime, duration) {
+    if (!videoId || !duration) return;
+    const percent = Math.min(100, Math.round((currentTime / duration) * 100));
+    // If watched more than 92%, consider completed and reset
+    if (percent > 92) {
+      delete this.watchProgress[videoId];
+    } else {
+      this.watchProgress[videoId] = {
+        currentTime: Math.floor(currentTime),
+        duration: Math.floor(duration),
+        percent: percent,
+        timestamp: Date.now()
+      };
+    }
+    this.saveUserScopedData('watch_progress', this.watchProgress);
+  }
+
+  getSavedPosition(videoId) {
+    if (!videoId) return 0;
+    const p = this.watchProgress[videoId];
+    return p ? p.currentTime : 0;
+  }
+
+  initDOM() {
+    // Navigation sidebar clicks
+    document.querySelectorAll('.nav-item').forEach(item => {
+      item.addEventListener('click', () => {
+        const section = item.dataset.section;
+        if (section) this.loadSection(section);
+      });
+    });
+
+    // User profile click (Profiles Switcher Modal / QR login)
+    document.getElementById('user-profile-btn').addEventListener('click', () => {
+      if ((this.accounts && this.accounts.length > 0) || this.api.isAuthorized()) {
+        this.openProfilesModal();
+      } else {
+        this.openQRModal();
+      }
+    });
+
+    // Player OSD buttons
+    document.getElementById('btn-play-pause').addEventListener('click', () => this.player.togglePlay());
+    document.getElementById('btn-rewind').addEventListener('click', () => this.player.seekBy(-10));
+    document.getElementById('btn-forward').addEventListener('click', () => this.player.seekBy(10));
+    document.getElementById('btn-quality').addEventListener('click', () => this.openQualityModal());
+    document.getElementById('btn-speed').addEventListener('click', () => this.openSpeedModal());
+    document.getElementById('btn-close-player').addEventListener('click', () => this.player.close());
+
+    // Progress bar click / seek
+    document.getElementById('progress-track').addEventListener('click', (e) => {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const pos = (e.clientX - rect.left) / rect.width;
+      if (this.player.video.duration) {
+        this.player.video.currentTime = pos * this.player.video.duration;
+        this.player.wakeOSD();
+      }
+    });
+
+    // Close Modals on background click
+    document.querySelectorAll('.modal-overlay').forEach(modal => {
+      modal.addEventListener('click', (e) => {
+        if (e.target === modal) this.closeAllModals();
+      });
+    });
+  }
+
+  updateUserCard() {
+    const nameEl = document.getElementById('user-name');
+    const statusEl = document.getElementById('user-status');
+    const avatarEl = document.getElementById('user-avatar');
+
+    if (this.api.isAuthorized()) {
+      const info = JSON.parse(localStorage.getItem('vk_user_info') || '{}');
+      nameEl.textContent = info.name || 'VK Пользователь';
+      statusEl.textContent = this.accounts && this.accounts.length > 1 ? 'Сменить профиль' : 'Авторизован';
+      if (info.photo) {
+        avatarEl.innerHTML = `<img src="${info.photo}" alt="Avatar">`;
+      } else {
+        avatarEl.innerHTML = (info.name || 'VK').slice(0, 2).toUpperCase();
+      }
+    } else {
+      nameEl.textContent = 'Войти по QR';
+      statusEl.textContent = 'Гостевой режим 4K';
+      avatarEl.innerHTML = 'VK';
+    }
+  }
+
+  async verifyUserAuth() {
+    if (this.api.isAuthorized()) {
+      const profile = await this.api.fetchUserProfile(this.api.userToken);
+      if (profile && profile.isRevoked) {
+        console.warn('[App] User token is explicitly revoked, removing from accounts');
+        if (this.activeUserId) {
+          this.accounts = this.accounts.filter(a => String(a.id) !== String(this.activeUserId));
+          try {
+            localStorage.setItem('vk_user_accounts', JSON.stringify(this.accounts));
+          } catch (e) {}
+        }
+        if (this.accounts.length > 0) {
+          this.switchUser(this.accounts[0].id);
+        } else {
+          this.api.logout();
+          this.activeUserId = null;
+          this.updateUserCard();
+        }
+      } else if (profile && profile.id) {
+        const acc = this.accounts.find(a => String(a.id) === String(this.activeUserId));
+        if (acc) {
+          acc.name = profile.name || acc.name;
+          acc.photo = profile.photo || acc.photo;
+          try {
+            localStorage.setItem('vk_user_accounts', JSON.stringify(this.accounts));
+            localStorage.setItem('vk_user_info', JSON.stringify(acc));
+          } catch (e) {}
+        }
+        this.updateUserCard();
+      }
+    }
+  }
+
+  switchSection(sectionId) {
+    return this.loadSection(sectionId);
+  }
+
+  async loadSection(sectionId) {
+    this.isNavigatingSection = true;
+    setTimeout(() => { this.isNavigatingSection = false; }, 400);
+    this.currentSection = sectionId;
+    this.currentChannel = null;
+
+    if (sectionId === 'search') {
+      this.searchQuery = '';
+    }
+
+    // Update active nav item
+    document.querySelectorAll('.nav-item').forEach(item => {
+      item.classList.toggle('active', item.dataset.section === sectionId);
+    });
+
+    const contentArea = document.getElementById('main-content');
+
+    try {
+      switch (sectionId) {
+        case 'home':
+          await this.renderHome();
+          break;
+        case 'subscriptions':
+          await this.renderSubscriptions();
+          break;
+        case 'search':
+          await this.renderSearch();
+          break;
+        case 'categories':
+          this.renderCategories();
+          break;
+        case 'favorites':
+          this.renderFavorites();
+          break;
+        case 'history':
+          this.renderHistory();
+          break;
+        case 'direct':
+          this.renderDirectInput();
+          break;
+      }
+      this.focusCurrentSection();
+    } catch (err) {
+      console.error('[App] Section load error:', err);
+      contentArea.innerHTML = `<div class="section-title">Ошибка загрузки</div><p style="color:#f85149;margin-top:15px;">${err.message}</p>`;
+    }
+  }
+
+  renderSkeletons(container, count = 8) {
+    container.innerHTML = Array(count).fill(0).map(() => `
+      <div class="skeleton-card">
+        <div class="skeleton-thumb"></div>
+        <div class="skeleton-text"></div>
+        <div class="skeleton-text short"></div>
+      </div>
+    `).join('');
+  }
+
+  async renderHome() {
+    this.homeFeedOffset = 192;
+    this.isLoadingMoreHome = false;
+    this.hasMoreHomeVideos = true;
+    this.initThumbnailObserver();
+
+    const content = document.getElementById('main-content');
+    const isAuth = this.api.isAuthorized();
+    let userName = '';
+    if (isAuth) {
+      try {
+        const u = JSON.parse(localStorage.getItem('vk_user_info') || '{}');
+        if (u.name) userName = u.name;
+      } catch (e) {}
+    }
+
+    // User-scoped storage keys for authorized vs guest feed
+    const userSuffix = this.activeUserId ? `user_${this.activeUserId}` : 'guest';
+    const cacheKey = `vk_home_showcase_v1_${userSuffix}`;
+
+    // 1. Instant Cache Render (Stale-While-Revalidate: 0 ms)
+    let cachedCatalog = this.homeCatalogCache;
+    if (!cachedCatalog) {
+      try {
+        const raw = localStorage.getItem(cacheKey);
+        if (raw) cachedCatalog = JSON.parse(raw);
+      } catch (e) {}
+    }
+
+    let hasRenderedCache = false;
+    if (cachedCatalog && cachedCatalog.shelves && cachedCatalog.shelves.length > 0) {
+      this.homeCatalogCache = cachedCatalog;
+      this.renderHomeShowcase(content, cachedCatalog, userName, isAuth);
+      this.focusCurrentSection();
+      hasRenderedCache = true;
+    } else {
+      this.renderHomeSkeletons(content);
+    }
+
+    // 2. Background Revalidation (Non-blocking, smooth SWR)
+    const now = Date.now();
+    const shouldRevalidate = !this.homeCatalogCacheTime || (now - this.homeCatalogCacheTime > 60000) || !hasRenderedCache;
+
+    if (shouldRevalidate) {
+      try {
+        const freshCatalog = await this.api.getHomeCatalog(this.history, this.watchProgress);
+        if (freshCatalog && freshCatalog.shelves && freshCatalog.shelves.length > 0) {
+          this.homeCatalogCache = freshCatalog;
+          this.homeCatalogCacheTime = Date.now();
+          try {
+            localStorage.setItem(cacheKey, JSON.stringify(freshCatalog));
+          } catch (e) {}
+
+          if (this.currentSection === 'home') {
+            this.renderHomeShowcase(content, freshCatalog, userName, isAuth);
+            this.focusCurrentSection();
+          }
+        }
+      } catch (err) {
+        console.warn('[App] Home catalog revalidation error:', err);
+        if (!hasRenderedCache) {
+          content.innerHTML = `<div style="color:var(--danger-color); font-size:22px; padding:30px;">Ошибка загрузки каталога: ${err.message}</div>`;
+        }
+      }
+    }
+  }
+
+  renderHomeSkeletons(container) {
+    container.innerHTML = `
+      <div class="home-showcase-container">
+        <div class="hero-showcase skeleton-loader" style="height: 440px; margin-bottom: 36px; border-radius: 24px;"></div>
+        <div class="shelves-wrapper">
+          <div class="shelf-container">
+            <div style="width: 250px; height: 32px; background: rgba(255,255,255,0.06); border-radius: 8px; margin-bottom: 16px;"></div>
+            <div class="shelf-row" style="overflow: hidden; gap: 24px; display: flex;">
+              <div class="video-card skeleton-card" style="width: 375px; min-width: 375px; height: 260px;"></div>
+              <div class="video-card skeleton-card" style="width: 375px; min-width: 375px; height: 260px;"></div>
+              <div class="video-card skeleton-card" style="width: 375px; min-width: 375px; height: 260px;"></div>
+              <div class="video-card skeleton-card" style="width: 375px; min-width: 375px; height: 260px;"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  renderHomeShowcase(container, catalog, userName, isAuth) {
+    container.innerHTML = '';
+    const wrapper = document.createElement('div');
+    wrapper.className = 'home-showcase-container';
+    wrapper.id = 'home-showcase-container';
+
+    // Hook scroll for seamless infinite loading
+    wrapper.addEventListener('scroll', () => {
+      this.onShowcaseScrolled(wrapper);
+    }, { passive: true });
+
+    // Hero Showcase Banner
+    if (catalog.hero) {
+      const hero = catalog.hero;
+      this.videoMap[hero.id] = hero;
+      const heroEl = document.createElement('div');
+      heroEl.className = 'hero-showcase';
+      heroEl.id = 'hero-showcase';
+      const heroDate = this.formatPublishDate(hero.date);
+
+      heroEl.innerHTML = `
+        <div class="hero-backdrop" style="background-image: url('${hero.thumbnail || ''}')"></div>
+        <div class="hero-gradient-overlay"></div>
+        <div class="hero-content">
+          <div class="hero-badges">
+            <span class="badge-showcase">${hero.heroBadge || 'ГЛАВНАЯ ПРЕМЬЕРА'}</span>
+            ${hero.is4K ? '<span class="badge-4k">4K UHD</span>' : '<span class="badge-fhd">1080p</span>'}
+            <span class="badge-adfree">БЕЗ РЕКЛАМЫ</span>
+          </div>
+          <div class="hero-title">${hero.title || ''}</div>
+          <div class="hero-meta">
+            <span class="hero-author">${hero.author || ''}</span>
+            <span class="meta-dot">•</span>
+            <span>${hero.views || ''}</span>
+            ${heroDate ? `<span class="meta-dot">•</span><span>${heroDate}</span>` : ''}
+          </div>
+          ${hero.description ? `<div class="hero-desc">${hero.description}</div>` : ''}
+          <div class="hero-actions">
+            <button class="hero-btn-play focusable" id="hero-btn-play" data-id="${hero.id}">
+              <svg class="hero-btn-icon" viewBox="0 0 24 24" fill="currentColor">
+                <polygon points="5,3 19,12 5,21"></polygon>
+              </svg>
+              <span>Смотреть</span>
+            </button>
+          </div>
+        </div>
+      `;
+
+      const playBtn = heroEl.querySelector('#hero-btn-play');
+      if (playBtn) {
+        playBtn.addEventListener('click', async () => {
+          this.showToast('Загрузка премьеры 4K...');
+          try {
+            const details = await this.api.getVideoDetails(hero.id);
+            this.player.loadAndPlay(details);
+          } catch (err) {
+            this.showToast(`Ошибка: ${err.message}`);
+          }
+        });
+      }
+      wrapper.appendChild(heroEl);
+    }
+
+    // Shelves
+    const shelvesWrap = document.createElement('div');
+    shelvesWrap.className = 'shelves-wrapper';
+    shelvesWrap.id = 'shelves-wrapper';
+
+    if (catalog.shelves && catalog.shelves.length > 0) {
+      catalog.shelves.forEach((shelf, shelfIdx) => {
+        if (!shelf.videos || shelf.videos.length === 0) return;
+
+        const shelfEl = document.createElement('div');
+        shelfEl.className = 'shelf-container';
+        shelfEl.id = `shelf-${shelf.id}`;
+        shelfEl.dataset.shelfId = shelf.id;
+
+        shelfEl.innerHTML = `
+          <div class="shelf-header">
+            <div class="shelf-title">
+              <span>${shelf.icon || '🎬'} ${shelf.title}</span>
+              <span class="badge-shelf-count">${shelf.videos.length}</span>
+            </div>
+            ${shelf.subtitle ? `<div class="shelf-subtitle">${shelf.subtitle}</div>` : ''}
+          </div>
+          <div class="shelf-row" id="shelf-row-${shelf.id}" data-shelf-id="${shelf.id}"></div>
+        `;
+
+        const rowEl = shelfEl.querySelector('.shelf-row');
+        shelf.videos.forEach((video, vIdx) => {
+          const isTop = (shelfIdx < 2 && vIdx < 5);
+          const card = this.createVideoCard(video, isTop, shelf.id);
+          if (card) rowEl.appendChild(card);
+        });
+
+        shelvesWrap.appendChild(shelfEl);
+      });
+    }
+
+    wrapper.appendChild(shelvesWrap);
+    container.appendChild(wrapper);
+  }
+
+  renderChannelsRow(channelsRow, channels) {
+    channelsRow.innerHTML = '';
+    if (channels && channels.length > 0) {
+      channels.forEach(ch => {
+        const chip = document.createElement('div');
+        chip.className = 'channel-chip focusable';
+        chip.dataset.id = ch.id;
+        chip.innerHTML = `
+          <img class="channel-chip-avatar" src="${ch.avatar}" alt="${ch.name}" onerror="this.src='assets/icon.png'">
+          <span class="channel-chip-name" title="${ch.name}">${ch.name}</span>
+        `;
+        chip.addEventListener('click', () => {
+          this.renderChannel(ch.id, ch.name);
+        });
+        channelsRow.appendChild(chip);
+      });
+    } else {
+      channelsRow.innerHTML = '<div style="color:var(--text-muted); font-size: 18px; padding: 10px;">Нет активных сообществ</div>';
+    }
+  }
+
+  async renderSubscriptions() {
+    const content = document.getElementById('main-content');
+    const isAuth = this.api.isAuthorized();
+
+    if (!isAuth) {
+      content.innerHTML = `
+        <div class="section-header">
+          <div class="section-title">
+            <span>Мои подписки</span>
+          </div>
+          <div class="section-subtitle">Для доступа к подпискам войдите в свой аккаунт VK</div>
+        </div>
+        <div style="background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 20px; padding: 50px; max-width: 800px; display: flex; flex-direction: column; gap: 24px;">
+          <div style="font-size: 24px; color: #f0f6fc;">Смотрите видео из ваших любимых сообществ и каналов на большом экране 4K</div>
+          <button class="player-btn focusable" id="subs-login-btn" style="background: #0077ff; padding: 18px 40px; font-size: 22px; width: fit-content;">⚡ Войти по QR-коду</button>
+        </div>
+      `;
+      const btn = document.getElementById('subs-login-btn');
+      if (btn) {
+        btn.addEventListener('click', () => this.openQRModal());
+        this.nav.setFocus(btn);
+      }
+      return;
+    }
+
+    content.innerHTML = `
+      <div class="section-header">
+        <div class="section-title">
+          <span>Мои подписки</span>
+          <span class="badge-4k">4K UHD</span>
+        </div>
+        <div class="section-subtitle">Каналы и свежие видео ваших подписок</div>
+      </div>
+
+      <div class="subscriptions-channels-section">
+        <div class="channels-carousel-title">Каналы и сообщества</div>
+        <div class="channels-carousel" id="subs-channels-row">
+          <div style="color:var(--text-muted); font-size: 18px; padding: 10px;">Загрузка каналов...</div>
+        </div>
+      </div>
+
+      <div class="feed-section-title" style="margin-top: 25px; margin-bottom: 15px; font-size: 26px; font-weight: 700;">Новые видео из ваших подписок</div>
+      <div class="video-grid" id="subs-feed-grid"></div>
+    `;
+
+    const channelsRow = document.getElementById('subs-channels-row');
+    const feedGrid = document.getElementById('subs-feed-grid');
+    const userSuffix = this.activeUserId ? `user_${this.activeUserId}` : 'guest';
+
+    // 1. Instant Cache Render (Stale-While-Revalidate: 0 ms)
+    let cachedChannels = this.subsChannelsCache;
+    let cachedFeed = this.subsFeedCache;
+    if (!cachedChannels || !cachedFeed) {
+      try {
+        const rawCh = localStorage.getItem(`vk_subs_channels_cache_${userSuffix}`);
+        const rawFeed = localStorage.getItem(`vk_subs_feed_cache_${userSuffix}`);
+        if (rawCh) cachedChannels = JSON.parse(rawCh);
+        if (rawFeed) cachedFeed = JSON.parse(rawFeed);
+      } catch (e) {}
+    }
+
+    let hasRenderedCache = false;
+    if (cachedChannels && cachedFeed && cachedChannels.length > 0) {
+      cachedFeed.sort((a, b) => (Number(b.date) || 0) - (Number(a.date) || 0));
+      this.subsChannelsCache = cachedChannels;
+      this.subsFeedCache = cachedFeed;
+      this.userSubscribedIds = new Set(cachedChannels.map(c => -Math.abs(c.id)));
+      this.renderChannelsRow(channelsRow, cachedChannels);
+      this.renderVideoCards(feedGrid, cachedFeed);
+      this.focusCurrentSection();
+      hasRenderedCache = true;
+    } else {
+      this.renderSkeletons(feedGrid, 8);
+    }
+
+    // 2. Background Revalidation
+    const now = Date.now();
+    const shouldRevalidate = !this.subsCacheTime || (now - this.subsCacheTime > 60000) || !hasRenderedCache;
+
+    if (shouldRevalidate) {
+      try {
+        const [channels, feedVideos] = await Promise.all([
+          this.api.getUserSubscriptions(80),
+          this.api.getUserSubscriptionsFeed(160, 240)
+        ]);
+
+        if (channels && channels.length > 0) {
+          this.userSubscribedIds = new Set(channels.map(c => -Math.abs(c.id)));
+        }
+
+        if (feedVideos && feedVideos.length > 0) {
+          feedVideos.sort((a, b) => (Number(b.date) || 0) - (Number(a.date) || 0));
+        }
+
+        this.subsChannelsCache = channels;
+        this.subsFeedCache = feedVideos;
+        this.subsCacheTime = Date.now();
+        try {
+          localStorage.setItem(`vk_subs_channels_cache_${userSuffix}`, JSON.stringify(channels));
+          localStorage.setItem(`vk_subs_feed_cache_${userSuffix}`, JSON.stringify(feedVideos));
+        } catch (e) {}
+
+        if (this.currentSection === 'subscriptions') {
+          this.renderChannelsRow(channelsRow, channels);
+          feedGrid.innerHTML = '';
+          if (feedVideos && feedVideos.length > 0) {
+            this.renderVideoCards(feedGrid, feedVideos);
+          } else {
+            feedGrid.innerHTML = '<div style="color:var(--text-muted); font-size: 22px; padding: 30px;">В ленте подписок пока нет новых длинных видео</div>';
+          }
+          this.focusCurrentSection();
+        }
+      } catch (err) {
+        console.error('[App] Subscriptions load error:', err);
+        if (!hasRenderedCache) {
+          feedGrid.innerHTML = `<div style="color:var(--danger-color); font-size:22px; padding:30px;">Ошибка загрузки подписок: ${err.message}</div>`;
+        }
+      }
+    }
+  }
+
+  renderCategories() {
+    this.currentCategory = null;
+    const content = document.getElementById('main-content');
+    const categories = [
+      { id: 'movies', title: 'Фильмы 4K', icon: '🎬' },
+      { id: 'series', title: 'Сериалы', icon: '📺' },
+      { id: 'shows', title: 'Шоу и Передачи', icon: '🎤' },
+      { id: 'games', title: 'Игры и Гейминг', icon: '🎮' },
+      { id: 'tech', title: 'Технологии и Гаджеты', icon: '💻' },
+      { id: 'nature', title: 'Природа 4K Relax', icon: '🌲' },
+      { id: 'kids', title: 'Детям и Мультфильмы', icon: '🧸' },
+      { id: 'music', title: 'Музыка и Клипы 4K', icon: '🎵' }
+    ];
+
+    content.innerHTML = `
+      <div class="section-header">
+        <div class="section-title">Категории контента</div>
+        <div class="section-subtitle">Выберите интересующую тематику видео</div>
+      </div>
+      <div class="video-grid" id="cat-grid" style="grid-template-columns: repeat(4, 1fr); gap: 24px; align-content: start; grid-auto-rows: max-content;">
+        ${categories.map(c => `
+          <div class="video-card focusable cat-card" data-cat="${c.id}" style="padding: 36px 20px; text-align: center; cursor: pointer; align-items: center; justify-content: center;">
+            <div style="font-size: 58px; margin-bottom: 16px;">${c.icon}</div>
+            <div style="font-size: 22px; font-weight: 700; color: var(--text-main);">${c.title}</div>
+          </div>
+        `).join('')}
+      </div>
+    `;
+
+    document.querySelectorAll('.cat-card').forEach(card => {
+      card.addEventListener('click', async () => {
+        const catId = card.dataset.cat;
+        const catTitle = card.querySelector('div:last-child').textContent;
+        this.currentCategory = catId;
+        content.innerHTML = `
+          <div class="section-header">
+            <div class="section-title">
+              <span>Категория: ${catTitle}</span>
+              <button class="player-btn focusable" id="cat-back-btn" style="font-size: 16px; padding: 6px 16px; margin-left: 15px;">⬅ Назад к категориям</button>
+            </div>
+            <div class="section-subtitle">Полноформатные видео в высоком разрешении без коротких клипов</div>
+          </div>
+          <div class="video-grid" id="video-grid"></div>
+        `;
+        document.getElementById('cat-back-btn').addEventListener('click', () => {
+          this.renderCategories();
+          this.focusCurrentSection();
+        });
+        const grid = document.getElementById('video-grid');
+        this.renderSkeletons(grid, 8);
+        const videos = await this.api.getCategory(catId);
+        grid.innerHTML = '';
+        this.renderVideoCards(grid, videos);
+        this.focusCurrentSection();
+      });
+    });
+  }
+
+  normalizeVoiceQuery(raw) {
+    if (!raw) return '';
+    let q = raw.trim().replace(/[.,!?;:]+$/, '').trim();
+    const lower = q.toLowerCase();
+    if (lower === 'вилса ком' || lower === 'вилсаком') return 'Wylsacom';
+    if (lower === 'чбд') return 'Что было дальше';
+    if (lower === 'лейбл смарт' || lower === 'лейблсмарт') return 'Labelsmart';
+    return q;
+  }
+
+  async getDynamicTrendingTags() {
+    if (this.cachedTrendingTags && this.cachedTrendingTags.length > 0) {
+      return this.cachedTrendingTags;
+    }
+
+    const baseTags = [
+      '🔥 Шоу Контакты', '🔥 Что Было Дальше', '🔥 Большое Шоу', '🔥 Кстати',
+      '🔥 Натальная Карта', '🔥 Женский Форум', '🔥 Вписка', '🔥 Stand Up',
+      '🔥 Плюшки', '🔥 Wylsacom', 'Космос 4K', 'Фильмы 4K', 'Природа 4K', 'Наука 4K'
+    ];
+
+    try {
+      let videos = this.homeFeedCache;
+      if (!videos || videos.length === 0) {
+        videos = await this.api.getTrending(24).catch(() => []);
+      }
+
+      if (videos && videos.length > 0) {
+        const dynamicSet = new Set();
+        for (const v of videos) {
+          if (!v) continue;
+          if (v.author && v.author.length >= 3 && v.author.length <= 22 && !/vk|видео|video/i.test(v.author)) {
+            dynamicSet.add(`🔥 ${v.author}`);
+          }
+          if (v.title) {
+            const parts = v.title.split(/[|—:\/«»]/).map(s => s.trim());
+            for (const p of parts) {
+              if (p.length >= 4 && p.length <= 24 && !/выпуск|сезон|серия|эпизод|\d{4}/i.test(p)) {
+                dynamicSet.add(`🔥 ${p}`);
+                break;
+              }
+            }
+          }
+          if (dynamicSet.size >= 8) break;
+        }
+
+        const combined = Array.from(new Set([...dynamicSet, ...baseTags])).slice(0, 16);
+        this.cachedTrendingTags = combined;
+        return combined;
+      }
+    } catch (e) {
+      console.warn('[App] Dynamic trending tags error:', e);
+    }
+
+    this.cachedTrendingTags = baseTags;
+    return baseTags;
+  }
+
+  async renderSearch() {
+    this.searchQuery = ''; // Always reset search query when opening search
+    const content = document.getElementById('main-content');
+    const tags = await this.getDynamicTrendingTags();
+
+    content.innerHTML = `
+      <div class="search-container">
+        <div class="search-input-box" id="search-box">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="#8b949e" style="flex-shrink:0;"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+          <input type="text"
+                 id="search-real-input"
+                 class="search-real-input focusable"
+                 placeholder="Введите название видео..."
+                 value=""
+                 autocomplete="off"
+                 autocorrect="off"
+                 autocapitalize="off"
+                 spellcheck="false" />
+          <button class="player-btn focusable" id="do-search-btn" style="padding: 10px 22px; font-size: 18px; font-weight:600;">Найти</button>
+          <button class="player-btn focusable" id="toggle-kb-btn" style="padding: 10px 20px; font-size: 18px;">⌨ Экранная</button>
+          <button class="player-btn focusable" id="clear-search-btn" style="padding: 10px 20px; font-size: 18px;">Очистить</button>
+        </div>
+
+        <div class="quick-tags-section" id="quick-tags-section" style="display:flex;">
+          <div class="quick-tags-title">
+            <span style="font-size: 22px;">🔥</span>
+            <span>Тренды и популярные темы в VK Видео:</span>
+          </div>
+          <div class="quick-tags-grid" id="quick-tags-grid">
+            ${tags.map(tag => {
+              const cleanQuery = tag.replace(/^[🔥#]\s*/, '');
+              return `<button class="quick-tag focusable" data-query="${cleanQuery}">${tag}</button>`;
+            }).join('')}
+          </div>
+        </div>
+
+        <div class="tv-keyboard" id="tv-keyboard" style="display:none;"></div>
+
+        <div class="video-grid" id="search-results-grid" style="flex: 1; min-height: 400px; overflow-y: auto;"></div>
+      </div>
+    `;
+
+    const searchInput = document.getElementById('search-real-input');
+    const quickTagsSec = document.getElementById('quick-tags-section');
+
+    const triggerSearchFromInput = () => {
+      if (!searchInput) return;
+      const raw = searchInput.value;
+      const normalized = this.normalizeVoiceQuery(raw);
+      if (!normalized) return;
+      this.searchQuery = normalized;
+      searchInput.value = normalized;
+
+      this.executeSearch();
+      searchInput.blur();
+    };
+
+    if (searchInput) {
+      // Keep query synced while user is typing without aggressively clearing or auto-searching
+      searchInput.addEventListener('input', () => {
+        this.searchQuery = searchInput.value;
+        const textEl = document.getElementById('search-display-text');
+        if (textEl) {
+          textEl.textContent = this.searchQuery || 'Поиск...';
+          if (this.searchQuery) textEl.classList.remove('placeholder');
+          else textEl.classList.add('placeholder');
+        }
+      });
+
+      searchInput.addEventListener('focus', () => {
+        setTimeout(() => {
+          try { searchInput.select(); } catch (e) {}
+        }, 10);
+      });
+
+      // User confirmed/committed input (e.g. voice speech-to-text done or IME commit)
+      searchInput.addEventListener('change', () => {
+        triggerSearchFromInput();
+      });
+
+      // Pressing OK / Enter executes the search immediately
+      searchInput.addEventListener('keydown', (e) => {
+        if (e.keyCode === 13) {
+          e.preventDefault();
+          triggerSearchFromInput();
+        }
+      });
+    }
+
+    const doSearchBtn = document.getElementById('do-search-btn');
+    if (doSearchBtn) {
+      doSearchBtn.addEventListener('click', () => {
+        triggerSearchFromInput();
+      });
+    }
+
+    // Bind Quick tags
+    content.querySelectorAll('.quick-tag').forEach(btn => {
+      btn.addEventListener('click', () => {
+        this.searchQuery = btn.dataset.query;
+        this.updateSearchInput();
+        this.executeSearch();
+      });
+    });
+
+    document.getElementById('toggle-kb-btn').addEventListener('click', () => {
+      const kb = document.getElementById('tv-keyboard');
+      if (kb) {
+        const isHidden = kb.style.display === 'none';
+        kb.style.display = isHidden ? 'flex' : 'none';
+        if (isHidden) {
+          const firstKey = kb.querySelector('.kb-key');
+          if (firstKey) this.nav.setFocus(firstKey);
+        }
+      }
+    });
+
+    document.getElementById('clear-search-btn').addEventListener('click', () => {
+      this.searchQuery = '';
+      if (searchInput) searchInput.value = '';
+      document.getElementById('search-results-grid').innerHTML = '';
+      if (quickTagsSec) quickTagsSec.style.display = 'flex';
+      const kb = document.getElementById('tv-keyboard');
+      if (kb) kb.style.display = 'none';
+      if (searchInput) this.nav.setFocus(searchInput);
+    });
+
+    this.renderKeyboard();
+  }
+
+  initKeyboard() {
+    this.kbLayouts = {
+      ru: [
+        ['1','2','3','4','5','6','7','8','9','0','-','_'],
+        ['Й','Ц','У','К','Е','Н','Г','Ш','Щ','З','Х','Ъ'],
+        ['Ф','Ы','В','А','П','Р','О','Л','Д','Ж','Э'],
+        ['Я','Ч','С','М','И','Т','Ь','Б','Ю','4K']
+      ],
+      en: [
+        ['1','2','3','4','5','6','7','8','9','0','-','_'],
+        ['Q','W','E','R','T','Y','U','I','O','P'],
+        ['A','S','D','F','G','H','J','K','L'],
+        ['Z','X','C','V','B','N','M','4K']
+      ]
+    };
+  }
+
+  renderKeyboard() {
+    const kbContainer = document.getElementById('tv-keyboard');
+    if (!kbContainer) return;
+
+    const rows = this.kbLayouts[this.keyboardLang];
+    kbContainer.innerHTML = `
+      ${rows.map(row => `
+        <div class="keyboard-row">
+          ${row.map(k => `<button class="kb-key focusable" data-char="${k}">${k}</button>`).join('')}
+        </div>
+      `).join('')}
+      <div class="keyboard-row">
+        <button class="kb-key action-key focusable" id="kb-lang-toggle">${this.keyboardLang === 'ru' ? 'EN' : 'RU'}</button>
+        <button class="kb-key space-key focusable" data-char=" ">ПРОБЕЛ</button>
+        <button class="kb-key action-key focusable" id="kb-backspace">⌫ СТЕРЕТЬ</button>
+        <button class="kb-key search-btn focusable" id="kb-do-search">🔍 НАЙТИ</button>
+      </div>
+    `;
+
+    kbContainer.querySelectorAll('.kb-key[data-char]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        this.searchQuery += btn.dataset.char;
+        this.updateSearchInput();
+      });
+    });
+
+    document.getElementById('kb-lang-toggle').addEventListener('click', () => {
+      this.keyboardLang = this.keyboardLang === 'ru' ? 'en' : 'ru';
+      this.renderKeyboard();
+      this.nav.setFocus(document.getElementById('kb-lang-toggle'));
+    });
+
+    document.getElementById('kb-backspace').addEventListener('click', () => {
+      this.searchQuery = this.searchQuery.slice(0, -1);
+      this.updateSearchInput();
+    });
+
+    document.getElementById('kb-do-search').addEventListener('click', () => {
+      this.executeSearch();
+    });
+  }
+
+  updateSearchInput() {
+    const input = document.getElementById('search-real-input');
+    if (input) {
+      input.value = this.searchQuery || '';
+    }
+    const textEl = document.getElementById('search-display-text');
+    if (textEl) {
+      if (this.searchQuery) {
+        textEl.textContent = this.searchQuery;
+        textEl.classList.remove('placeholder');
+      } else {
+        textEl.textContent = 'Введите запрос...';
+        textEl.classList.add('placeholder');
+      }
+    }
+  }
+
+  async executeSearch() {
+    if (!this.searchQuery || !this.searchQuery.trim()) return;
+    const grid = document.getElementById('search-results-grid');
+    const kb = document.getElementById('tv-keyboard');
+    const quickTagsSec = document.getElementById('quick-tags-section');
+
+    // Collapse quick tags and keyboard when results are fetched so user can view full-screen results
+    if (quickTagsSec) quickTagsSec.style.display = 'none';
+    if (kb) kb.style.display = 'none';
+
+    grid.innerHTML = '';
+    this.renderSkeletons(grid, 8);
+    this.showToast(`Поиск: "${this.searchQuery}"`);
+
+    const results = await this.api.search(this.searchQuery, 60);
+    grid.innerHTML = '';
+    if (!results || results.length === 0) {
+      grid.innerHTML = `
+        <div style="font-size: 24px; color:#8b949e; padding: 40px 10px;">
+          По запросу «${this.searchQuery}» видео не найдено. Нажмите «Очистить», чтобы выбрать тренды.
+        </div>
+      `;
+      if (quickTagsSec) quickTagsSec.style.display = 'flex';
+      if (kb) kb.style.display = 'flex';
+    } else {
+      this.renderVideoCards(grid, results);
+      this.showToast(`Найдено ${results.length} видео`);
+      const firstCard = grid.querySelector('.video-card');
+      if (firstCard) this.nav.setFocus(firstCard);
+    }
+  }
+
+  /**
+   * Automated Voice Search Macro (Triggered exclusively by Red Button):
+   * 1. Navigates cleanly into Search.
+   * 2. Focuses search input to summon the webOS Virtual Keyboard.
+   * 3. Awaits keyboard deployment (detected via viewport resize).
+   * 4. Dispatches 7x Right Arrow + 1x OK via low-level networkinput service to trigger voice microphone.
+   */
+  async triggerVoiceSearchMacro() {
+    this.searchQuery = '';
+    await this.loadSection('search');
+
+    const searchInput = document.getElementById('search-real-input');
+    if (!searchInput) return;
+
+    searchInput.value = '';
+    if (this.nav) this.nav.setFocus(searchInput);
+    searchInput.focus();
+    searchInput.click();
+
+    this.showToast('🎙️ Активация микрофона...');
+
+    // Start key navigation in sync with virtual keyboard appearance (280ms / 100ms)
+    const isAlreadyFocused = document.activeElement === searchInput;
+    const waitTime = isAlreadyFocused ? 100 : 280;
+    await new Promise(resolve => setTimeout(resolve, waitTime));
+
+    // Native webOS sendKeyCode macro via networkinput service (fast movement + stable settle & click)
+    const cmd = "for i in 1 2 3 4 5 6 7; do luna-send -n 1 luna://com.webos.service.networkinput/test/sendKeyCode '{\"keyCode\": 106}' >/dev/null; done; usleep 75000; luna-send -n 1 luna://com.webos.service.networkinput/test/sendKeyCode '{\"keyCode\": 352}' >/dev/null; luna-send -n 1 luna://com.webos.service.networkinput/test/sendKeyCode '{\"keyCode\": 28}' >/dev/null";
+
+    try {
+      if (window.webOS && window.webOS.service) {
+        window.webOS.service.request('luna://org.webosbrew.hbchannel.service', {
+          method: 'exec',
+          parameters: { command: cmd },
+          onSuccess: (res) => {
+            console.log('[VoiceMacro] Key macro executed successfully');
+          },
+          onFailure: (err) => {
+            console.warn('[VoiceMacro] Execution failed:', err);
+          }
+        });
+      }
+    } catch (e) {
+      console.warn('[VoiceMacro] Error dispatching macro:', e);
+    }
+  }
+
+  renderDirectInput() {
+    const content = document.getElementById('main-content');
+    content.innerHTML = `
+      <div class="section-header">
+        <div class="section-title">Воспроизвести по ссылке или ID</div>
+        <div class="section-subtitle">Вставьте прямую ссылку VK Video или идентификатор вида -22822305_456241859</div>
+      </div>
+      <div style="background:#161b22; padding: 40px; border-radius: 20px; max-width: 900px; display:flex; flex-direction:column; gap:25px;">
+        <input type="text" id="direct-input" class="focusable" placeholder="Например: -22822305_456241859 или vk.com/video..." style="background:#21262d; border:2px solid rgba(255,255,255,0.15); color:#fff; font-size:22px; padding:18px 24px; border-radius:14px; width:100%;">
+        <div style="display:flex; gap:15px;">
+          <button class="player-btn focusable" id="direct-play-btn" style="background:#0077ff; padding:16px 36px; font-size:20px;">⚡ Запустить в 4K</button>
+          <button class="player-btn focusable" id="demo-4k-btn" style="background:#21262d; padding:16px 25px; font-size:18px;">Вставить демо 4K видео</button>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('demo-4k-btn').addEventListener('click', () => {
+      document.getElementById('direct-input').value = '-22822305_456241859';
+      this.showToast('Вставлен демо-ID');
+    });
+
+    document.getElementById('direct-play-btn').addEventListener('click', async () => {
+      const val = document.getElementById('direct-input').value.trim();
+      if (!val) {
+        this.showToast('Введите ссылку или ID');
+        return;
+      }
+      this.playByDirectId(val);
+    });
+  }
+
+  async playByDirectId(input) {
+    let videoId = input;
+    const match = input.match(/video(-?\d+_\d+)/);
+    if (match) {
+      videoId = match[1];
+    }
+    this.showToast('Загрузка видеопотока 4K...');
+    try {
+      const details = await this.api.getVideoDetails(videoId);
+      this.player.loadAndPlay(details);
+    } catch (err) {
+      this.showToast(`Ошибка: ${err.message}`);
+    }
+  }
+
+  renderFavorites() {
+    const content = document.getElementById('main-content');
+    content.innerHTML = `
+      <div class="section-header">
+        <div class="section-title">Избранное</div>
+        <div class="section-subtitle">${this.favorites.length} сохраненных видео</div>
+      </div>
+      <div class="video-grid" id="video-grid"></div>
+    `;
+    const grid = document.getElementById('video-grid');
+    if (this.favorites.length === 0) {
+      grid.innerHTML = '<div style="color:#8b949e; font-size:22px;">Вы еще не добавили ни одного видео в избранное</div>';
+    } else {
+      this.renderVideoCards(grid, this.favorites);
+    }
+  }
+
+  renderHistory() {
+    const content = document.getElementById('main-content');
+    content.innerHTML = `
+      <div class="section-header">
+        <div class="section-title">История просмотров</div>
+        <button class="player-btn focusable" id="clear-hist-btn" style="font-size:16px;">Очистить историю</button>
+      </div>
+      <div class="video-grid" id="video-grid"></div>
+    `;
+
+    const clearBtn = document.getElementById('clear-hist-btn');
+    if (clearBtn) {
+      clearBtn.addEventListener('click', () => {
+        this.history = [];
+        this.saveUserScopedData('history', []);
+        this.renderHistory();
+        this.showToast('История очищена');
+      });
+    }
+
+    const grid = document.getElementById('video-grid');
+    if (this.history.length === 0) {
+      grid.innerHTML = '<div style="color:#8b949e; font-size:22px;">История пуста</div>';
+    } else {
+      this.renderVideoCards(grid, this.history);
+    }
+  }
+
+  initThumbnailObserver() {
+    if (this.thumbnailObserver) {
+      try {
+        this.thumbnailObserver.disconnect();
+      } catch (e) {}
+      this.thumbnailObserver = null;
+    }
+    const blankGif = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+    if (typeof IntersectionObserver !== 'undefined') {
+      this.thumbnailObserver = new IntersectionObserver((entries) => {
+        for (let i = 0; i < entries.length; i++) {
+          const entry = entries[i];
+          const img = entry.target;
+          if (entry.isIntersecting) {
+            const realSrc = img.dataset.src;
+            if (realSrc && img.getAttribute('src') !== realSrc) {
+              img.src = realSrc;
+            }
+          } else {
+            // Far offscreen (exceeded 1400px margin): release decoded GPU texture to protect TV memory
+            const currentSrc = img.getAttribute('src');
+            if (currentSrc && currentSrc !== blankGif && !currentSrc.startsWith('data:image/svg')) {
+              img.src = blankGif;
+            }
+          }
+        }
+      }, {
+        root: null,
+        rootMargin: '1400px 0px 1400px 0px'
+      });
+    }
+  }
+
+  createVideoCard(video, isTopViewport = false, shelfId = null) {
+    if (!video || !video.id) return null;
+    this.videoMap[video.id] = video;
+    const card = document.createElement('div');
+    card.className = 'video-card focusable';
+    card.dataset.id = video.id;
+    if (shelfId) {
+      card.dataset.shelfId = shelfId;
+    }
+
+    const progress = this.watchProgress[video.id];
+    const progressPercent = video.progressPercent || (progress && progress.percent > 2 ? progress.percent : 0);
+    const dateStr = this.formatPublishDate(video.date);
+    const blankGif = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+    const initialThumb = (isTopViewport || !this.thumbnailObserver) ? video.thumbnail : blankGif;
+
+    card.innerHTML = `
+        <div class="card-thumb-wrap">
+          <img class="card-thumb" 
+               src="${initialThumb}" 
+               data-src="${video.thumbnail}"
+               alt="${video.title}" 
+               decoding="async" 
+               ${isTopViewport ? 'loading="eager" fetchpriority="high"' : 'loading="lazy"'} 
+               onerror="this.src='assets/splashBackground.png'">
+          <div class="card-badges-row">
+            ${video.isLive ? '<span class="badge-overlay-live">🔴 LIVE</span>' : ''}
+            ${video.isRecommended ? '<span class="badge-overlay-rec">💡 РЕКОМЕНДАЦИЯ</span>' : ''}
+            ${video.is4K && !video.isLive ? '<span class="badge-overlay-4k">4K UHD</span>' : ''}
+            ${video.isHD && !video.is4K && !video.isLive ? '<span class="badge-overlay-fhd">1080p</span>' : ''}
+          </div>
+          <span class="duration-badge">${video.isLive ? 'В ЭФИРЕ' : video.duration}</span>
+          ${progressPercent > 2 ? `<div class="card-progress-bar"><div class="card-progress-fill" style="width: ${progressPercent}%"></div></div>` : ''}
+        </div>
+        <div class="card-body">
+          <div class="card-title" title="${video.title}">${video.title}</div>
+          <div class="card-meta">
+            <span class="card-author">${video.author}</span>
+            <div class="card-meta-right">
+              <span>${video.views}</span>
+              ${dateStr ? `<span class="meta-dot">•</span><span class="card-date">${dateStr}</span>` : ''}
+            </div>
+          </div>
+        </div>
+      `;
+
+      const img = card.querySelector('.card-thumb');
+      if (img && this.thumbnailObserver) {
+        this.thumbnailObserver.observe(img);
+      }
+
+      // Pointer / Air mouse long-press handling
+      let longPressTimer = null;
+      let isLongPressed = false;
+
+      const handlePressStart = (e) => {
+        if (e.button !== undefined && e.button !== 0) return;
+        isLongPressed = false;
+        clearTimeout(longPressTimer);
+        longPressTimer = setTimeout(() => {
+          isLongPressed = true;
+          this.openVideoContextMenu(video);
+        }, 500);
+      };
+
+      const handlePressEnd = () => {
+        clearTimeout(longPressTimer);
+        if (isLongPressed) {
+          setTimeout(() => {
+            isLongPressed = false;
+          }, 450);
+        }
+      };
+
+      card.addEventListener('mousedown', handlePressStart);
+      card.addEventListener('mouseup', handlePressEnd);
+      card.addEventListener('mouseleave', handlePressEnd);
+      card.addEventListener('touchstart', handlePressStart, { passive: true });
+      card.addEventListener('touchend', handlePressEnd);
+
+      card.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        this.openVideoContextMenu(video);
+      });
+
+      card.addEventListener('click', async (e) => {
+        if (isLongPressed) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        this.showToast('Загрузка видеопотока 4K...');
+        try {
+          const details = await this.api.getVideoDetails(video.id);
+          this.player.loadAndPlay(details);
+        } catch (err) {
+          console.error('[App] Play error:', err);
+          this.showToast(`Ошибка: ${err.message}`);
+        }
+      });
+
+    return card;
+  }
+
+  renderVideoCards(container, list) {
+    if (!list || list.length === 0) {
+      container.innerHTML = '<div style="color:var(--text-muted); font-size:22px; padding:30px;">Нет доступных полноформатных видео</div>';
+      return;
+    }
+    list.forEach((video, idx) => {
+      const card = this.createVideoCard(video, idx < 16);
+      if (card) container.appendChild(card);
+    });
+  }
+
+  appendVideoCards(container, list) {
+    if (!list || list.length === 0 || !container) return;
+    const fragment = document.createDocumentFragment();
+    list.forEach(video => {
+      if (!video || !video.id) return;
+      if (this.videoMap[video.id]) return; // Strictly eliminate duplicates
+      const card = this.createVideoCard(video, false);
+      if (card) fragment.appendChild(card);
+    });
+    container.appendChild(fragment);
+
+    // Memory Guard: prune videoMap cache when it grows large (> 600 items)
+    const keys = Object.keys(this.videoMap);
+    if (keys.length > 600) {
+      for (let i = 0; i < 200; i++) {
+        delete this.videoMap[keys[i]];
+      }
+    }
+  }
+
+  onElementFocused(element) {
+    if (!element || this.currentSection !== 'home') return;
+    if (this.isLoadingMoreHome || !this.hasMoreHomeVideos) return;
+
+    if (element.classList && element.classList.contains('video-card')) {
+      // Check shelves in home showcase
+      const shelves = document.querySelectorAll('.shelf-container');
+      if (shelves.length > 0) {
+        const lastShelf = shelves[shelves.length - 1];
+        if (lastShelf && lastShelf.contains(element)) {
+          this.loadMoreHomeShelves();
+        }
+      }
+
+      // Check legacy/fallback grid if present
+      const grid = document.getElementById('video-grid');
+      if (grid) {
+        const allCards = grid.querySelectorAll('.video-card');
+        const idx = Array.prototype.indexOf.call(allCards, element);
+        if (idx >= allCards.length - 12) {
+          this.loadMoreHomeFeed();
+        }
+      }
+    }
+  }
+
+  onShowcaseScrolled(container) {
+    if (!container || this.currentSection !== 'home') return;
+    if (this.isLoadingMoreHome || !this.hasMoreHomeVideos) return;
+    if (container.scrollTop + container.clientHeight >= container.scrollHeight - 700) {
+      this.loadMoreHomeShelves();
+    }
+  }
+
+  async loadMoreHomeShelves() {
+    if (this.isLoadingMoreHome || !this.hasMoreHomeVideos || this.currentSection !== 'home') return;
+    this.isLoadingMoreHome = true;
+    const shelvesWrap = document.getElementById('shelves-wrapper');
+    if (!shelvesWrap) {
+      this.isLoadingMoreHome = false;
+      return;
+    }
+
+    try {
+      const moreVideos = await this.api.getMoreSmartFeedVideos(
+        this.homeFeedOffset,
+        36,
+        this.history,
+        this.watchProgress
+      );
+
+      if (moreVideos && moreVideos.length > 0) {
+        this.homeFeedOffset += moreVideos.length;
+        const pageNum = Math.floor(this.homeFeedOffset / 36);
+        const shelfEl = document.createElement('div');
+        shelfEl.className = 'shelf-container';
+        const shelfId = `extra_rec_${pageNum}`;
+        shelfEl.id = `shelf-${shelfId}`;
+        shelfEl.dataset.shelfId = shelfId;
+
+        shelfEl.innerHTML = `
+          <div class="shelf-header">
+            <div class="shelf-title">
+              <span>✨ Еще рекомендации • Подборка ${pageNum}</span>
+              <span class="badge-shelf-count">${moreVideos.length}</span>
+            </div>
+          </div>
+          <div class="shelf-row" id="shelf-row-${shelfId}" data-shelf-id="${shelfId}"></div>
+        `;
+
+        const rowEl = shelfEl.querySelector('.shelf-row');
+        moreVideos.forEach(v => {
+          const card = this.createVideoCard(v, false, shelfId);
+          if (card) rowEl.appendChild(card);
+        });
+
+        shelvesWrap.appendChild(shelfEl);
+        this.hasMoreHomeVideos = true;
+      }
+    } catch (e) {
+      console.warn('[App] loadMoreHomeShelves error:', e);
+    } finally {
+      this.isLoadingMoreHome = false;
+    }
+  }
+
+  onGridScrolled(grid) {
+    if (!grid || this.currentSection !== 'home') return;
+    if (this.isLoadingMoreHome || !this.hasMoreHomeVideos) return;
+    if (grid.scrollTop + grid.clientHeight >= grid.scrollHeight - 900) {
+      this.loadMoreHomeFeed();
+    }
+  }
+
+  async loadMoreHomeFeed() {
+    if (this.isLoadingMoreHome || !this.hasMoreHomeVideos || this.currentSection !== 'home') return;
+    this.isLoadingMoreHome = true;
+    const grid = document.getElementById('video-grid');
+    if (!grid) {
+      this.isLoadingMoreHome = false;
+      return;
+    }
+
+    try {
+      const moreVideos = await this.api.getMoreSmartFeedVideos(
+        this.homeFeedOffset,
+        48,
+        this.history,
+        this.watchProgress
+      );
+
+      if (moreVideos && moreVideos.length > 0) {
+        this.homeFeedOffset += moreVideos.length;
+        this.appendVideoCards(grid, moreVideos);
+        // Truly infinite: keep hasMoreHomeVideos true
+        this.hasMoreHomeVideos = true;
+      } else {
+        // Advance offset and keep infinite scroll alive for subsequent scrolling
+        this.homeFeedOffset += 24;
+      }
+    } catch (e) {
+      console.warn('[App] loadMoreHomeFeed error:', e);
+    } finally {
+      this.isLoadingMoreHome = false;
+    }
+  }
+
+  /**
+   * Video Context Menu Modal (Triggered by Long-Press on Card)
+   */
+  openVideoContextMenu(video) {
+    const modal = document.getElementById('video-context-modal');
+    if (!modal) return;
+
+    this.selectedContextVideo = video;
+    this.contextModalOpenTime = Date.now();
+    const canClick = () => Date.now() - (this.contextModalOpenTime || 0) > 400;
+
+    const titleEl = document.getElementById('context-modal-title');
+    const channelNameEl = document.getElementById('ctx-channel-name');
+    const favTextEl = document.getElementById('ctx-favorite-text');
+
+    if (titleEl) titleEl.textContent = video.title || 'Действия с видео';
+    if (channelNameEl) channelNameEl.textContent = video.author || 'Канал';
+
+    const isFav = this.favorites.some(f => f.id === video.id);
+    if (favTextEl) {
+      favTextEl.textContent = isFav ? '❌ Удалить из избранного' : '⭐ Добавить в избранное';
+    }
+
+    const btnChannel = document.getElementById('ctx-btn-channel');
+    const btnSub = document.getElementById('ctx-btn-subscribe');
+    const subTextEl = document.getElementById('ctx-subscribe-text');
+    const btnPlay = document.getElementById('ctx-btn-play');
+    const btnFav = document.getElementById('ctx-btn-favorite');
+    const btnClose = document.getElementById('ctx-btn-close');
+
+    const ownerId = parseInt(video.id.split('_')[0], 10);
+
+    // Channel subscription handler
+    if (btnSub && subTextEl) {
+      if (!this.api.isAuthorized()) {
+        subTextEl.textContent = '➕ Войти, чтобы подписаться';
+        btnSub.onclick = (e) => {
+          if (!canClick()) return;
+          this.closeAllModals();
+          this.openQRModal();
+        };
+      } else {
+        const isSubscribed = this.userSubscribedIds && this.userSubscribedIds.has(ownerId);
+        subTextEl.textContent = isSubscribed ? '➖ Отписаться от канала' : '➕ Подписаться на канал';
+
+        // Async verification via API in background
+        this.api.checkIsSubscribed(ownerId).then(actualIsSub => {
+          if (this.selectedContextVideo && this.selectedContextVideo.id === video.id) {
+            if (actualIsSub) {
+              if (this.userSubscribedIds) this.userSubscribedIds.add(ownerId);
+            } else {
+              if (this.userSubscribedIds) this.userSubscribedIds.delete(ownerId);
+            }
+            subTextEl.textContent = actualIsSub ? '➖ Отписаться от канала' : '➕ Подписаться на канал';
+          }
+        }).catch(() => {});
+
+        btnSub.onclick = async (e) => {
+          if (!canClick()) return;
+          const currentIsSub = this.userSubscribedIds && this.userSubscribedIds.has(ownerId);
+          try {
+            if (currentIsSub) {
+              await this.api.unsubscribeChannel(ownerId);
+              if (this.userSubscribedIds) this.userSubscribedIds.delete(ownerId);
+              subTextEl.textContent = '➕ Подписаться на канал';
+              this.showToast(`Вы отписались от канала «${video.author || 'Канал'}»`);
+            } else {
+              await this.api.subscribeChannel(ownerId);
+              if (this.userSubscribedIds) this.userSubscribedIds.add(ownerId);
+              subTextEl.textContent = '➖ Отписаться от канала';
+              this.showToast(`Вы подписались на канал «${video.author || 'Канал'}»`);
+            }
+            // Invalidate subscriptions feed cache so changes show up immediately in "Мои подписки"
+            this.subsFeedCache = null;
+            this.subsChannelsCache = null;
+            this.subsCacheTime = 0;
+          } catch (subErr) {
+            this.showToast(`Ошибка: ${subErr.message}`);
+          }
+        };
+      }
+    }
+
+    btnChannel.onclick = (e) => {
+      if (!canClick()) return;
+      this.closeAllModals();
+      this.renderChannel(ownerId, video.author);
+    };
+
+    btnPlay.onclick = async (e) => {
+      if (!canClick()) return;
+      this.closeAllModals();
+      this.showToast('Загрузка видеопотока 4K...');
+      try {
+        const details = await this.api.getVideoDetails(video.id);
+        this.player.loadAndPlay(details);
+      } catch (err) {
+        this.showToast(`Ошибка: ${err.message}`);
+      }
+    };
+
+    btnFav.onclick = (e) => {
+      if (!canClick()) return;
+      this.toggleFavorite(video);
+      this.closeAllModals();
+    };
+
+    btnClose.onclick = (e) => {
+      if (!canClick()) return;
+      this.closeAllModals();
+    };
+
+    modal.style.display = 'flex';
+    modal.style.pointerEvents = 'none';
+    setTimeout(() => {
+      modal.style.pointerEvents = 'auto';
+    }, 400);
+
+    this.nav.setFocus(btnChannel);
+  }
+
+  toggleFavorite(video) {
+    const idx = this.favorites.findIndex(f => f.id === video.id);
+    if (idx !== -1) {
+      this.favorites.splice(idx, 1);
+      this.showToast('Удалено из избранного');
+    } else {
+      this.favorites.push(video);
+      this.showToast('⭐ Добавлено в избранное');
+    }
+    this.saveUserScopedData('favorites', this.favorites);
+    if (this.currentSection === 'favorites') {
+      this.renderFavorites();
+    }
+  }
+
+  async renderChannel(ownerId, channelName = 'Канал') {
+    this.currentChannel = {
+      ownerId: ownerId,
+      channelName: channelName,
+      previousSection: this.currentSection || 'home'
+    };
+
+    const content = document.getElementById('main-content');
+    content.innerHTML = `
+      <div class="section-header">
+        <div class="section-title">
+          <span>📺 Канал: ${channelName}</span>
+          <button class="player-btn focusable" id="channel-back-btn" style="font-size: 16px; padding: 6px 16px; margin-left: 15px;">⬅ Назад</button>
+        </div>
+        <div class="section-subtitle">Полноформатные видео канала без рекламы и шортсов</div>
+      </div>
+      <div class="video-grid" id="video-grid"></div>
+    `;
+
+    document.getElementById('channel-back-btn').addEventListener('click', () => {
+      this.handleBack();
+    });
+
+    const grid = document.getElementById('video-grid');
+    this.renderSkeletons(grid, 8);
+    this.showToast(`Загрузка канала: ${channelName}...`);
+
+    try {
+      const videos = await this.api.getChannelVideos(ownerId, 40, channelName, 240);
+      grid.innerHTML = '';
+      if (!videos || videos.length === 0) {
+        grid.innerHTML = '<div style="color:var(--text-muted); font-size:22px; padding:30px;">На этом канале нет доступных длинных видео</div>';
+      } else {
+        this.renderVideoCards(grid, videos);
+      }
+      this.focusCurrentSection();
+    } catch (err) {
+      grid.innerHTML = `<div style="color:var(--danger-color); font-size:22px; padding:30px;">Ошибка загрузки видео канала: ${err.message}</div>`;
+    }
+  }
+
+  /**
+   * QR-Code Login Modal (Official VK Smart TV Device Flow)
+   */
+  async openQRModal(forceFresh = false) {
+    const modal = document.getElementById('qr-modal');
+    const container = document.getElementById('qr-canvas-container');
+    const statusEl = document.getElementById('qr-status');
+    const codeEl = document.getElementById('qr-auth-code');
+    const refreshBtn = document.getElementById('btn-refresh-qr');
+
+    if (!modal) return;
+    modal.style.display = 'flex';
+
+    const now = Date.now();
+    let codeData = this.activeDeviceAuth;
+
+    // Only fetch new code if forced or older than 3 minutes
+    if (forceFresh || !codeData || (now - codeData.created > 180000)) {
+      if (codeEl) codeEl.textContent = '-------';
+      if (statusEl) statusEl.textContent = 'Получение кода авторизации...';
+      if (container) container.innerHTML = '';
+      clearInterval(this.qrPollTimer);
+
+      try {
+        const fresh = await this.api.getDeviceAuthCode();
+        codeData = {
+          ...fresh,
+          created: Date.now()
+        };
+        this.activeDeviceAuth = codeData;
+      } catch (e) {
+        if (statusEl) statusEl.textContent = 'Ошибка получения кода: ' + e.message;
+        if (refreshBtn) {
+          refreshBtn.onclick = () => this.openQRModal(true);
+        }
+        return;
+      }
+    }
+
+    if (codeEl) codeEl.textContent = codeData.authCode;
+
+    // Render crisp QR Code pointing directly to VK OAuth confirmation
+    if (window.qrcode && container) {
+      container.innerHTML = '';
+      const qr = window.qrcode(0, 'M');
+      qr.addData(codeData.qrUrl);
+      qr.make();
+      container.innerHTML = qr.createSvgTag(6, 0);
+    }
+
+    if (statusEl) statusEl.textContent = '🟢 Ожидание подтверждения...';
+
+    if (refreshBtn) {
+      refreshBtn.onclick = () => {
+        this.openQRModal(true);
+      };
+    }
+
+    // Start Polling for user confirmation on mobile or vk.com/activate
+    clearInterval(this.qrPollTimer);
+    this.qrPollTimer = setInterval(async () => {
+      try {
+        const res = await this.api.pollDeviceToken(codeData.authHash || codeData.deviceId);
+        if (res && res.status === 'success' && res.token) {
+          clearInterval(this.qrPollTimer);
+          this.activeDeviceAuth = null;
+          await this.completeLoginWithToken(res.token, res.userId);
+        } else if (res && res.status === 'expired') {
+          console.warn('[QR Poll] Code expired on VK server');
+          if (statusEl) statusEl.textContent = '⚠️ Код устарел. Нажмите «Обновить код».';
+        }
+      } catch (pollErr) {
+        console.warn('[QR Poll] error:', pollErr);
+      }
+    }, 2000);
+
+    const closeBtn = document.getElementById('btn-close-qr');
+    if (closeBtn) this.nav.setFocus(closeBtn);
+  }
+
+  async completeLoginWithToken(token, userId) {
+    const statusEl = document.getElementById('qr-status');
+    if (statusEl) statusEl.textContent = '🔄 Подтверждение получено! Загрузка профиля...';
+    this.showToast('Вход подтвержден на телефоне!');
+    
+    clearInterval(this.qrPollTimer);
+    this.activeDeviceAuth = null;
+
+    // 1. Save token immediately to guarantee persistent session
+    this.api.setToken(token);
+
+    // 2. Fetch user profile with resilient fallback
+    let profile = null;
+    try {
+      profile = await this.api.fetchUserProfile(token, userId);
+    } catch (e) {
+      console.warn('[App] fetchUserProfile error:', e);
+    }
+
+    if (!profile) {
+      profile = {
+        id: userId || 'me',
+        name: 'Пользователь VK',
+        photo: null
+      };
+    }
+
+    // 3. Save into multi-account registry
+    const newAccount = {
+      id: profile.id,
+      name: profile.name,
+      photo: profile.photo,
+      token: token,
+      addedAt: Date.now()
+    };
+
+    if (!this.accounts) this.accounts = [];
+    const existingIdx = this.accounts.findIndex(a => String(a.id) === String(newAccount.id));
+    if (existingIdx !== -1) {
+      this.accounts[existingIdx] = newAccount;
+    } else {
+      this.accounts.push(newAccount);
+    }
+
+    this.activeUserId = newAccount.id;
+    try {
+      localStorage.setItem('vk_user_accounts', JSON.stringify(this.accounts));
+      localStorage.setItem('vk_active_user_id', String(newAccount.id));
+      localStorage.setItem('vk_user_token', token);
+      localStorage.setItem('vk_user_info', JSON.stringify(newAccount));
+    } catch (e) {
+      console.warn('[App] localStorage write error:', e);
+    }
+
+    this.loadUserScopedData(newAccount.id);
+
+    if (statusEl) statusEl.textContent = `✅ Успешно! Добро пожаловать, ${profile.name}!`;
+    this.showToast(`Авторизован: ${profile.name}`);
+
+    setTimeout(() => {
+      this.closeAllModals();
+      this.updateUserCard();
+      this.loadSection('home');
+    }, 1200);
+  }
+
+  /**
+   * Quality Selection Modal
+   */
+  openQualityModal() {
+    const modal = document.getElementById('quality-modal');
+    const list = document.getElementById('quality-options-list');
+    list.innerHTML = '';
+
+    const levels = this.player.availableLevels;
+    if (!levels || levels.length === 0) {
+      list.innerHTML = '<div style="color:#8b949e;padding:10px;">Для этого потока качество фиксировано</div>';
+    } else {
+      // Deduplicate by unique height to guarantee clean 2-column TV display
+      const heightMap = new Map();
+      levels.forEach((lvl, idx) => {
+        const h = lvl.height || 0;
+        if (h > 0) {
+          if (!heightMap.has(h) || (lvl.bitrate && lvl.bitrate > (heightMap.get(h).lvl.bitrate || 0))) {
+            heightMap.set(h, { lvl, originalIndex: idx });
+          }
+        }
+      });
+
+      const sortedLevels = Array.from(heightMap.values())
+        .sort((a, b) => (b.lvl.height || 0) - (a.lvl.height || 0));
+
+      const currentActiveLvl = this.player.availableLevels[this.player.currentLevelIndex];
+
+      sortedLevels.forEach(({ lvl, originalIndex }) => {
+        const btn = document.createElement('button');
+        const is4k = lvl.height >= 2160;
+        const is2k = lvl.height === 1440;
+        const is1080 = lvl.height === 1080;
+        
+        let label = `${lvl.height}p`;
+        let tag = '';
+        if (is4k) {
+          const isAv1 = this.player.shakaPlayer !== null;
+          label = isAv1 ? '4K Ultra HD (2160p) [AV1]' : '4K Ultra HD (2160p)';
+          tag = isAv1
+            ? '<span class="badge-4k" style="background:#16a34a;color:#fff;">4K AV1 60fps ПЛАВНО</span>'
+            : '<span class="badge-4k" style="background:#dc2626;color:#fff;">MAX 4K</span>';
+        } else if (is2k) {
+          label = '2K Quad HD (1440p)';
+          tag = '<span class="badge-4k" style="background:#16a34a;color:#fff;">60fps РЕКОМЕНДУЕТСЯ</span>';
+        } else if (is1080) {
+          label = 'Full HD (1080p)';
+          tag = '<span class="badge-4k" style="background:#2563eb;color:#fff;">60fps ПЛАВНО</span>';
+        }
+
+        const isActive = this.player.currentLevelIndex !== -1 && currentActiveLvl && currentActiveLvl.height === lvl.height;
+        btn.className = `option-btn focusable ${isActive ? 'active' : ''}`;
+        btn.innerHTML = `<span style="display:flex;align-items:center;gap:12px;">${label} ${isActive ? '✓' : ''}</span> ${tag}`;
+        btn.addEventListener('click', () => {
+          this.player.setQuality(originalIndex);
+          this.closeAllModals();
+        });
+        list.appendChild(btn);
+      });
+
+      // Auto level at bottom (spans 2 columns)
+      const autoBtn = document.createElement('button');
+      const isAutoActive = this.player.currentLevelIndex === -1;
+      autoBtn.className = `option-btn auto-quality-btn focusable ${isAutoActive ? 'active' : ''}`;
+      autoBtn.innerHTML = `<span>Автоматический выбор (Адаптивный) ${isAutoActive ? '✓' : ''}</span>`;
+      autoBtn.addEventListener('click', () => {
+        this.player.setQuality(-1);
+        this.closeAllModals();
+      });
+      list.appendChild(autoBtn);
+    }
+
+    modal.style.display = 'flex';
+    const activeOption = list.querySelector('.option-btn.active') || list.querySelector('.option-btn');
+    if (activeOption) this.nav.setFocus(activeOption);
+  }
+
+  /**
+   * Playback Speed Modal
+   */
+  openSpeedModal() {
+    const modal = document.getElementById('speed-modal');
+    const list = document.getElementById('speed-options-list');
+    list.innerHTML = '';
+
+    const speeds = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+    speeds.forEach(sp => {
+      const btn = document.createElement('button');
+      btn.className = `option-btn focusable ${this.player.video.playbackRate === sp ? 'active' : ''}`;
+      btn.textContent = `${sp}x ${sp === 1.0 ? '(Стандартная)' : ''}`;
+      btn.addEventListener('click', () => {
+        this.player.setSpeed(sp);
+        this.closeAllModals();
+      });
+      list.appendChild(btn);
+    });
+
+    modal.style.display = 'flex';
+    const currentSpeedBtn = list.querySelector('.option-btn.active') || list.querySelector('.option-btn');
+    if (currentSpeedBtn) this.nav.setFocus(currentSpeedBtn);
+  }
+
+  isModalOpen() {
+    return Array.from(document.querySelectorAll('.modal-overlay')).some(m => m.style.display === 'flex');
+  }
+
+  closeAllModals() {
+    // Keep background qrPollTimer alive if user closes modal while confirming on phone
+    document.querySelectorAll('.modal-overlay').forEach(m => {
+      m.style.display = 'none';
+      m.style.pointerEvents = 'auto';
+    });
+    if (this.player.container.style.display !== 'none') {
+      this.nav.setFocus(document.getElementById('btn-play-pause'));
+    } else {
+      this.focusCurrentSection();
+    }
+  }
+
+  handleBack() {
+    if (this.isModalOpen()) {
+      this.closeAllModals();
+      return;
+    }
+    if (this.player.container.style.display !== 'none') {
+      this.player.close();
+      return;
+    }
+    if (this.currentChannel) {
+      const prev = this.currentChannel.previousSection || 'home';
+      this.currentChannel = null;
+      if (prev === 'categories' && this.currentCategory) {
+        this.selectCategory(this.currentCategory);
+      } else {
+        this.loadSection(prev);
+      }
+      return;
+    }
+    if (this.currentCategory) {
+      this.currentCategory = null;
+      this.renderCategories();
+      this.focusCurrentSection();
+      return;
+    }
+    // If on search screen with active query or results, Back clears search and restores trending cloud first!
+    if (this.currentSection === 'search') {
+      const searchInput = document.getElementById('search-real-input');
+      const resultsGrid = document.getElementById('search-results-grid');
+      const quickTagsSec = document.getElementById('quick-tags-section');
+      if (this.searchQuery || (resultsGrid && resultsGrid.children.length > 0)) {
+        this.searchQuery = '';
+        if (searchInput) {
+          searchInput.value = '';
+          this.nav.setFocus(searchInput);
+        }
+        if (resultsGrid) resultsGrid.innerHTML = '';
+        if (quickTagsSec) quickTagsSec.style.display = 'flex';
+        const kb = document.getElementById('tv-keyboard');
+        if (kb) kb.style.display = 'none';
+        return;
+      }
+    }
+    if (this.currentSection !== 'home') {
+      this.loadSection('home');
+      return;
+    }
+
+    // Double-Back to exit gracefully (Standard TV UX, only on home screen)
+    const now = Date.now();
+    if (this.lastBackTime && (now - this.lastBackTime < 2400)) {
+      if (window.webOS && window.webOS.platformBack) {
+        window.webOS.platformBack();
+      } else {
+        window.close();
+      }
+    } else {
+      this.lastBackTime = now;
+      this.showToast('Нажмите «Назад» ещё раз для выхода');
+    }
+  }
+
+  formatPublishDate(timestamp) {
+    if (!timestamp) return '';
+    let ts = Number(timestamp);
+    if (!ts || isNaN(ts)) return '';
+    if (ts < 10000000000) ts *= 1000;
+
+    const now = Date.now();
+    const diffSec = Math.floor((now - ts) / 1000);
+    if (diffSec < 0) return 'только что';
+
+    const diffMin = Math.floor(diffSec / 60);
+    const diffHours = Math.floor(diffMin / 60);
+    const diffDays = Math.floor(diffHours / 24);
+
+    const plural = (num, one, two, five) => {
+      const n = Math.abs(num) % 100;
+      const n1 = n % 10;
+      if (n > 10 && n < 20) return five;
+      if (n1 > 1 && n1 < 5) return two;
+      if (n1 === 1) return one;
+      return five;
+    };
+
+    if (diffMin < 1) return 'только что';
+    if (diffMin < 60) return `${diffMin} ${plural(diffMin, 'минуту', 'минуты', 'минут')} назад`;
+    if (diffHours < 24) return `${diffHours} ${plural(diffHours, 'час', 'часа', 'часов')} назад`;
+    if (diffDays === 1) return 'вчера';
+    if (diffDays < 7) return `${diffDays} ${plural(diffDays, 'день', 'дня', 'дней')} назад`;
+
+    const d = new Date(ts);
+    const months = ['янв.', 'февр.', 'мар.', 'апр.', 'мая', 'июн.', 'июл.', 'авг.', 'сент.', 'окт.', 'нояб.', 'дек.'];
+    const day = d.getDate();
+    const month = months[d.getMonth()] || '';
+    const year = d.getFullYear();
+    const curYear = new Date().getFullYear();
+
+    if (year === curYear) {
+      return `${day} ${month}`;
+    }
+    return `${day} ${month} ${year}`;
+  }
+
+  focusCurrentSection() {
+    setTimeout(() => {
+      const activeNav = document.querySelector('.nav-item.active');
+      if (this.nav && this.nav.currentFocused && document.getElementById('sidebar').contains(this.nav.currentFocused)) {
+        if (!this.isNavigatingSection) return;
+      }
+      const target = document.querySelector('#main-content .focusable') || activeNav;
+      if (target && this.nav) this.nav.setFocus(target);
+    }, 50);
+  }
+
+  addToHistory(video) {
+    if (!video || !video.id) return;
+    this.history = this.history.filter(v => v.id !== video.id);
+    const durStr = typeof video.duration === 'number'
+      ? this.api.formatDuration(video.duration)
+      : (video.duration || 'Видео');
+    const viewsStr = typeof video.views === 'number'
+      ? this.api.formatViews(video.views)
+      : (video.views || '');
+
+    this.history.unshift({
+      id: video.id,
+      title: video.title || 'Видео',
+      author: video.author || 'Канал',
+      duration: durStr,
+      views: viewsStr,
+      thumbnail: video.thumbnail || '',
+      is4K: !!(video.is4K || (video.maxQuality && video.maxQuality.includes('4K'))),
+      watchedAt: Date.now()
+    });
+    if (this.history.length > 50) this.history.pop();
+    this.saveUserScopedData('history', this.history);
+  }
+
+  showToast(text) {
+    const toast = document.getElementById('toast');
+    toast.textContent = text;
+    toast.classList.add('show');
+    clearTimeout(this.toastTimeout);
+    this.toastTimeout = setTimeout(() => {
+      toast.classList.remove('show');
+    }, 3200);
+  }
+}
+
+window.VKVideoApp = VKVideoApp;
+
+function bootstrapApp() {
+  if (!window.vkApp) {
+    console.log('[VKVideoApp] Bootstrapping application on TV...');
+    window.app = window.vkApp = new VKVideoApp();
+  }
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', bootstrapApp);
+} else {
+  bootstrapApp();
+}

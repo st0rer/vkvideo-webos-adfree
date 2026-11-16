@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=1920, height=1080, initial-scale=1.0, user-scalable=no">
+  <title>VK Video AdFree 4K</title>
+  <link rel="preconnect" href="https://vkuserphoto.ru" crossorigin>
+  <link rel="preconnect" href="https://userapi.com" crossorigin>
+  <link rel="dns-prefetch" href="//vkuserphoto.ru">
+  <link rel="dns-prefetch" href="//userapi.com">
+  <link rel="dns-prefetch" href="//vk.com">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+  <!-- Main Application Wrapper -->
+  <div id="app">
+    
+    <!-- Collapsible Leanback Sidebar -->
+    <aside id="sidebar">
+      <div class="brand">
+        <img src="assets/icon.png" alt="VK Video" class="brand-icon">
+        <div class="brand-title">
+          <span>VK Видео</span>
+          <span class="badge-4k">4K</span>
+        </div>
+      </div>
+
+      <nav class="nav-menu">
+        <div class="nav-item focusable active" data-section="home">
+          <svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
+          <span>Главная</span>
+        </div>
+
+        <div class="nav-item focusable" data-section="subscriptions">
+          <svg viewBox="0 0 24 24"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-8 12.5v-9l6 4.5-6 4.5z"/></svg>
+          <span>Подписки</span>
+        </div>
+
+        <div class="nav-item focusable" data-section="search">
+          <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+          <span>Поиск</span>
+        </div>
+
+        <div class="nav-item focusable" data-section="categories">
+          <svg viewBox="0 0 24 24"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H8V4h12v12z"/></svg>
+          <span>Категории</span>
+        </div>
+
+        <div class="nav-item focusable" data-section="favorites">
+          <svg viewBox="0 0 24 24"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>
+          <span>Избранное</span>
+        </div>
+
+        <div class="nav-item focusable" data-section="history">
+          <svg viewBox="0 0 24 24"><path d="M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6c0-3.87 3.13-7 7-7s7 3.13 7 7-3.13 7-7 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.954 8.954 0 0 0 13 21a9 9 0 0 0 0-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg>
+          <span>История</span>
+        </div>
+
+        <div class="nav-item focusable" data-section="direct">
+          <svg viewBox="0 0 24 24"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>
+          <span>По ссылке / ID</span>
+        </div>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="user-status-card focusable" id="user-profile-btn">
+          <div class="user-avatar" id="user-avatar">VK</div>
+          <div class="user-info">
+            <span class="user-name" id="user-name">Войти по QR</span>
+            <span class="user-status" id="user-status">Гостевой режим 4K</span>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Dynamic Content -->
+    <main id="main-content">
+      <!-- Injected by app.js -->
+    </main>
+  </div>
+
+  <!-- Full-Screen Hardware-Accelerated 4K Video Player -->
+  <div id="player-container" style="display: none;">
+    <video id="native-player" webkit-playsinline></video>
+
+    <!-- Central Progressive Seek Bubble -->
+    <div id="seek-bubble">
+      <span id="seek-bubble-icon">⏩</span>
+      <span id="seek-bubble-text">+10s</span>
+    </div>
+
+    <!-- Player On-Screen Display (OSD) -->
+    <div id="player-osd">
+      
+      <!-- Top Info -->
+      <div class="osd-top">
+        <div class="osd-video-info">
+          <div class="osd-title" id="osd-video-title">Загрузка видео...</div>
+          <div class="osd-channel" id="osd-video-channel">VK Video</div>
+        </div>
+        <div class="osd-badges">
+          <span class="adfree-live-badge">БЕЗ РЕКЛАМЫ</span>
+          <span class="active-quality-badge" id="osd-active-quality">4K UHD</span>
+        </div>
+      </div>
+
+      <!-- Center Spinner -->
+      <div class="osd-center">
+        <div class="center-buffering" id="osd-buffering"></div>
+      </div>
+
+      <!-- Bottom Controls -->
+      <div class="osd-bottom">
+        <div class="progress-container">
+          <span class="progress-time" id="time-current">0:00</span>
+          <div class="progress-track focusable" id="progress-track" tabindex="0">
+            <div class="progress-buffered" id="progress-buffered"></div>
+            <div class="progress-played" id="progress-played"></div>
+            <div class="progress-thumb" id="progress-thumb"></div>
+          </div>
+          <span class="progress-time" id="time-total">0:00</span>
+        </div>
+
+        <div class="controls-bar">
+          <div class="controls-left">
+            <button class="player-btn focusable" id="btn-play-pause">
+              <svg id="play-btn-icon" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+              <span id="play-btn-text">Пауза</span>
+            </button>
+            <button class="player-btn focusable" id="btn-rewind">
+              <svg viewBox="0 0 24 24"><path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z"/></svg>
+              <span>-10s</span>
+            </button>
+            <button class="player-btn focusable" id="btn-forward">
+              <svg viewBox="0 0 24 24"><path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z"/></svg>
+              <span>+10s</span>
+            </button>
+          </div>
+
+          <div class="controls-right">
+            <button class="player-btn focusable" id="btn-quality">
+              <svg viewBox="0 0 24 24"><path d="M19 4H5c-1.11 0-2 .9-2 2v12c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H5V6h14v12z"/></svg>
+              <span>Качество</span>
+            </button>
+            <button class="player-btn focusable" id="btn-speed">
+              <svg viewBox="0 0 24 24"><path d="M20.38 8.57l-1.23 1.85a8 8 0 0 1-.22 7.58H5.07A8 8 0 0 1 15.58 6.85l1.85-1.23A10 10 0 0 0 3.35 19a2 2 0 0 0 1.72 1h13.85a2 2 0 0 0 1.74-1 10 10 0 0 0-.28-10.43zM10.59 15.41a2 2 0 1 0 2.83-2.83l-4-4-1.41 1.41 2.58 2.59z"/></svg>
+              <span>Скорость</span>
+            </button>
+            <button class="player-btn focusable" id="btn-close-player" style="background: rgba(248, 81, 73, 0.25); border-color: #f85149;">
+              <svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+              <span>Закрыть</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Quality Modal Popup -->
+  <div class="modal-overlay" id="quality-modal">
+    <div class="modal-card">
+      <div class="modal-title">Выбор разрешения видео</div>
+      <div class="modal-options" id="quality-options-list">
+        <!-- Rendered by app.js -->
+      </div>
+    </div>
+  </div>
+
+  <!-- Speed Modal Popup -->
+  <div class="modal-overlay" id="speed-modal">
+    <div class="modal-card">
+      <div class="modal-title">Скорость воспроизведения</div>
+      <div class="modal-options" id="speed-options-list">
+        <!-- Rendered by app.js -->
+      </div>
+    </div>
+  </div>
+
+  <!-- Video Context Menu Modal (Long-Press) -->
+  <div class="modal-overlay" id="video-context-modal">
+    <div class="modal-card" style="min-width: 680px; max-width: 780px;">
+      <div class="modal-title" id="context-modal-title">Действия с видео</div>
+      <div class="modal-options" id="context-modal-options">
+        <button class="option-btn focusable" id="ctx-btn-play">
+          <span style="display:flex; align-items:center; gap:12px;">▶ Воспроизвести</span>
+        </button>
+        <button class="option-btn focusable" id="ctx-btn-channel">
+          <span style="display:flex; align-items:center; gap:12px;">📺 Перейти на канал (<span id="ctx-channel-name">Канал</span>)</span>
+        </button>
+        <button class="option-btn focusable" id="ctx-btn-subscribe">
+          <span style="display:flex; align-items:center; gap:12px;" id="ctx-subscribe-text">➕ Подписаться на канал</span>
+        </button>
+        <button class="option-btn focusable" id="ctx-btn-favorite">
+          <span style="display:flex; align-items:center; gap:12px;" id="ctx-favorite-text">⭐ Добавить в избранное</span>
+        </button>
+        <button class="option-btn focusable" id="ctx-btn-close" style="background: #2d333b;">
+          <span>✕ Закрыть</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- User Profiles Management Modal (Multi-Account Switcher) -->
+  <div class="modal-overlay" id="profiles-modal">
+    <div class="modal-card" style="min-width: 720px; max-width: 860px; padding: 30px;">
+      <div class="modal-title" style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 8px;">
+        <span>Профили пользователей</span>
+        <span style="font-size:16px; color:var(--text-muted); font-weight:normal;">VK Video 4K</span>
+      </div>
+      <div style="color:var(--text-muted); font-size:16px; margin-bottom: 20px;">
+        Переключайтесь между аккаунтами со своими рекомендациями, подписками и историей
+      </div>
+      <div id="profiles-list" style="display:flex; flex-direction:column; gap:12px; margin-bottom: 24px; max-height: 420px; overflow-y:auto; padding: 4px;">
+        <!-- Injected dynamically -->
+      </div>
+      <div style="display:flex; gap:14px; justify-content:flex-end;">
+        <button class="player-btn focusable" id="btn-add-profile" style="font-size:17px; padding:12px 24px; background:var(--accent-color); color:#fff; border-radius:12px;">
+          ➕ Добавить пользователя
+        </button>
+        <button class="player-btn focusable" id="btn-close-profiles" style="font-size:17px; padding:12px 24px; background:#2d333b; border-radius:12px;">
+          ✕ Закрыть
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- QR Code Login Modal (Official VK Smart TV Device Flow) -->
+  <div class="modal-overlay" id="qr-modal">
+    <div class="modal-card" style="max-width: 860px; padding: 32px;">
+      <div class="modal-title" style="font-size: 26px; margin-bottom: 20px;">Вход в аккаунт ВКонтакте</div>
+      <div class="qr-modal-body" style="display: flex; gap: 36px; align-items: center;">
+        <div id="qr-canvas-container" style="background: #fff; padding: 14px; border-radius: 16px; display: flex; align-items: center; justify-content: center; box-shadow: 0 8px 24px rgba(0,0,0,0.5);"></div>
+        <div class="qr-instructions" style="flex: 1; display: flex; flex-direction: column; gap: 12px;">
+          <div class="qr-step" style="font-size: 18px; line-height: 1.4;">
+            <b style="color: #58a6ff;">1.</b> Наведите камеру телефона на QR-код и подтвердите вход (нажмите <b style="color: #3fb950;">«Разрешить»</b>).
+          </div>
+          <div class="qr-step" style="font-size: 18px; line-height: 1.4;">
+            <b style="color: #58a6ff;">2.</b> Или откройте в браузере любого устройства:<br>
+            <span style="font-size: 22px; font-weight: 700; color: #fff;">vk.com/activate</span>
+          </div>
+          <div style="margin-top: 4px;">
+            <div style="font-size: 14px; color: #8b949e; margin-bottom: 4px;">Код активации:</div>
+            <div id="qr-auth-code" style="font-size: 36px; font-weight: 800; letter-spacing: 6px; color: #58a6ff; font-family: monospace; padding: 10px 20px; background: #161b22; border: 1px solid #30363d; border-radius: 12px; display: inline-block;">-------</div>
+          </div>
+          <div id="qr-status" style="font-size: 16px; color: #3fb950; margin-top: 6px; display: flex; align-items: center; gap: 8px;">
+            🟢 Ожидание подтверждения...
+          </div>
+        </div>
+      </div>
+      <div style="margin-top: 24px; border-top: 1px solid #30363d; padding-top: 18px; display: flex; justify-content: flex-end; gap: 14px; width: 100%;">
+        <button class="player-btn focusable" id="btn-refresh-qr" style="padding: 12px 24px; background: #21262d; border-radius: 10px; font-size: 16px;">🔄 Обновить код</button>
+        <button class="player-btn focusable" id="btn-close-qr" onclick="window.vkApp.closeAllModals()" style="padding: 12px 28px; background: #2d333b; border-radius: 10px; font-size: 16px;">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Global Toast Notification -->
+  <div id="toast">Уведомление</div>
+
+  <!-- Scripts -->
+  <script src="js/webOSTV.js"></script>
+  <script src="js/shaka-player.compiled.js"></script>
+  <script src="js/hls.min.js"></script>
+  <script src="js/qrcode.min.js"></script>
+  <script src="js/curated_catalog.js"></script>
+  <script src="js/api.js"></script>
+  <script src="js/player.js"></script>
+  <script src="js/navigation.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
