@@ -560,177 +560,81 @@ class VKVideoApp {
       } catch (e) {}
     }
 
+    content.innerHTML = `
+      <div class="section-header">
+        <div class="section-title">
+          <span>${isAuth ? (userName ? `Для вас, ${userName}` : 'Для вас') : 'Тренды и рекомендации'}</span>
+          <span class="badge-4k">4K UHD</span>
+          <span class="badge-adfree">БЕЗ РЕКЛАМЫ</span>
+        </div>
+        <div class="section-subtitle">${isAuth ? 'Самые просматриваемые каналы, свежие видео и похожие рекомендации' : 'Автоматическое аппаратное воспроизведение в максимальном разрешении'}</div>
+      </div>
+      <div class="video-grid" id="video-grid"></div>
+    `;
+
+    const grid = document.getElementById('video-grid');
+    if (grid) {
+      grid.addEventListener('scroll', () => {
+        this.onGridScrolled(grid);
+      }, { passive: true });
+    }
+
     // User-scoped storage keys for authorized vs guest feed
     const userSuffix = this.activeUserId ? `user_${this.activeUserId}` : 'guest';
-    const cacheKey = `vk_home_showcase_v1_${userSuffix}`;
+    const cacheKey = isAuth ? `vk_home_feed_cache_auth_v7_${userSuffix}` : 'vk_home_feed_cache_guest_v7';
 
-    // 1. Instant Cache Render (Stale-While-Revalidate: 0 ms)
-    let cachedCatalog = this.homeCatalogCache;
-    if (!cachedCatalog) {
+    // 1. Instant Cache Render (Stale-While-Revalidate: 0-15 ms)
+    let cachedVideos = this.homeFeedCache;
+    if (!cachedVideos) {
       try {
         const raw = localStorage.getItem(cacheKey);
-        if (raw) cachedCatalog = JSON.parse(raw);
+        if (raw) cachedVideos = JSON.parse(raw);
       } catch (e) {}
     }
 
     let hasRenderedCache = false;
-    if (cachedCatalog && cachedCatalog.shelves && cachedCatalog.shelves.length > 0) {
-      this.homeCatalogCache = cachedCatalog;
-      this.renderHomeShowcase(content, cachedCatalog, userName, isAuth);
+    if (cachedVideos && cachedVideos.length >= (isAuth ? 12 : 6)) {
+      this.homeFeedCache = cachedVideos;
+      this.renderVideoCards(grid, cachedVideos);
       this.focusCurrentSection();
       hasRenderedCache = true;
     } else {
-      this.renderHomeSkeletons(content);
+      this.renderSkeletons(grid, 8);
     }
 
     // 2. Background Revalidation (Non-blocking, smooth SWR)
     const now = Date.now();
-    const shouldRevalidate = !this.homeCatalogCacheTime || (now - this.homeCatalogCacheTime > 60000) || !hasRenderedCache;
+    const shouldRevalidate = !this.homeFeedCacheTime || (now - this.homeFeedCacheTime > 60000) || !hasRenderedCache;
 
     if (shouldRevalidate) {
       try {
-        const freshCatalog = await this.api.getHomeCatalog(this.history, this.watchProgress);
-        if (freshCatalog && freshCatalog.shelves && freshCatalog.shelves.length > 0) {
-          this.homeCatalogCache = freshCatalog;
-          this.homeCatalogCacheTime = Date.now();
+        let freshVideos = [];
+        if (isAuth) {
+          freshVideos = await this.api.getSmartFeed(192, this.history, this.watchProgress);
+        } else {
+          freshVideos = await this.api.getTrending(48);
+        }
+
+        if (freshVideos && freshVideos.length > 0) {
+          this.homeFeedCache = freshVideos;
+          this.homeFeedCacheTime = Date.now();
           try {
-            localStorage.setItem(cacheKey, JSON.stringify(freshCatalog));
+            localStorage.setItem(cacheKey, JSON.stringify(freshVideos.slice(0, 120)));
           } catch (e) {}
 
           if (this.currentSection === 'home') {
-            this.renderHomeShowcase(content, freshCatalog, userName, isAuth);
+            grid.innerHTML = '';
+            this.renderVideoCards(grid, freshVideos);
             this.focusCurrentSection();
           }
         }
       } catch (err) {
-        console.warn('[App] Home catalog revalidation error:', err);
+        console.warn('[App] Home feed revalidation error:', err);
         if (!hasRenderedCache) {
-          content.innerHTML = `<div style="color:var(--danger-color); font-size:22px; padding:30px;">Ошибка загрузки каталога: ${err.message}</div>`;
+          grid.innerHTML = `<div style="color:var(--danger-color); font-size:22px; padding:30px;">Ошибка загрузки видео: ${err.message}</div>`;
         }
       }
     }
-  }
-
-  renderHomeSkeletons(container) {
-    container.innerHTML = `
-      <div class="home-showcase-container">
-        <div class="hero-showcase skeleton-loader" style="height: 440px; margin-bottom: 36px; border-radius: 24px;"></div>
-        <div class="shelves-wrapper">
-          <div class="shelf-container">
-            <div style="width: 250px; height: 32px; background: rgba(255,255,255,0.06); border-radius: 8px; margin-bottom: 16px;"></div>
-            <div class="shelf-row" style="overflow: hidden; gap: 24px; display: flex;">
-              <div class="video-card skeleton-card" style="width: 375px; min-width: 375px; height: 260px;"></div>
-              <div class="video-card skeleton-card" style="width: 375px; min-width: 375px; height: 260px;"></div>
-              <div class="video-card skeleton-card" style="width: 375px; min-width: 375px; height: 260px;"></div>
-              <div class="video-card skeleton-card" style="width: 375px; min-width: 375px; height: 260px;"></div>
-            </div>
-          </div>
-        </div>
-      </div>
-    `;
-  }
-
-  renderHomeShowcase(container, catalog, userName, isAuth) {
-    container.innerHTML = '';
-    const wrapper = document.createElement('div');
-    wrapper.className = 'home-showcase-container';
-    wrapper.id = 'home-showcase-container';
-
-    // Hook scroll for seamless infinite loading
-    wrapper.addEventListener('scroll', () => {
-      this.onShowcaseScrolled(wrapper);
-    }, { passive: true });
-
-    // Hero Showcase Banner
-    if (catalog.hero) {
-      const hero = catalog.hero;
-      this.videoMap[hero.id] = hero;
-      const heroEl = document.createElement('div');
-      heroEl.className = 'hero-showcase';
-      heroEl.id = 'hero-showcase';
-      const heroDate = this.formatPublishDate(hero.date);
-
-      heroEl.innerHTML = `
-        <div class="hero-backdrop" style="background-image: url('${hero.thumbnail || ''}')"></div>
-        <div class="hero-gradient-overlay"></div>
-        <div class="hero-content">
-          <div class="hero-badges">
-            <span class="badge-showcase">${hero.heroBadge || 'ГЛАВНАЯ ПРЕМЬЕРА'}</span>
-            ${hero.is4K ? '<span class="badge-4k">4K UHD</span>' : '<span class="badge-fhd">1080p</span>'}
-            <span class="badge-adfree">БЕЗ РЕКЛАМЫ</span>
-          </div>
-          <div class="hero-title">${hero.title || ''}</div>
-          <div class="hero-meta">
-            <span class="hero-author">${hero.author || ''}</span>
-            <span class="meta-dot">•</span>
-            <span>${hero.views || ''}</span>
-            ${heroDate ? `<span class="meta-dot">•</span><span>${heroDate}</span>` : ''}
-          </div>
-          ${hero.description ? `<div class="hero-desc">${hero.description}</div>` : ''}
-          <div class="hero-actions">
-            <button class="hero-btn-play focusable" id="hero-btn-play" data-id="${hero.id}">
-              <svg class="hero-btn-icon" viewBox="0 0 24 24" fill="currentColor">
-                <polygon points="5,3 19,12 5,21"></polygon>
-              </svg>
-              <span>Смотреть</span>
-            </button>
-          </div>
-        </div>
-      `;
-
-      const playBtn = heroEl.querySelector('#hero-btn-play');
-      if (playBtn) {
-        playBtn.addEventListener('click', async () => {
-          this.showToast('Загрузка премьеры 4K...');
-          try {
-            const details = await this.api.getVideoDetails(hero.id);
-            this.player.loadAndPlay(details);
-          } catch (err) {
-            this.showToast(`Ошибка: ${err.message}`);
-          }
-        });
-      }
-      wrapper.appendChild(heroEl);
-    }
-
-    // Shelves
-    const shelvesWrap = document.createElement('div');
-    shelvesWrap.className = 'shelves-wrapper';
-    shelvesWrap.id = 'shelves-wrapper';
-
-    if (catalog.shelves && catalog.shelves.length > 0) {
-      catalog.shelves.forEach((shelf, shelfIdx) => {
-        if (!shelf.videos || shelf.videos.length === 0) return;
-
-        const shelfEl = document.createElement('div');
-        shelfEl.className = 'shelf-container';
-        shelfEl.id = `shelf-${shelf.id}`;
-        shelfEl.dataset.shelfId = shelf.id;
-
-        shelfEl.innerHTML = `
-          <div class="shelf-header">
-            <div class="shelf-title">
-              <span>${shelf.icon || '🎬'} ${shelf.title}</span>
-              <span class="badge-shelf-count">${shelf.videos.length}</span>
-            </div>
-            ${shelf.subtitle ? `<div class="shelf-subtitle">${shelf.subtitle}</div>` : ''}
-          </div>
-          <div class="shelf-row" id="shelf-row-${shelf.id}" data-shelf-id="${shelf.id}"></div>
-        `;
-
-        const rowEl = shelfEl.querySelector('.shelf-row');
-        shelf.videos.forEach((video, vIdx) => {
-          const isTop = (shelfIdx < 2 && vIdx < 5);
-          const card = this.createVideoCard(video, isTop, shelf.id);
-          if (card) rowEl.appendChild(card);
-        });
-
-        shelvesWrap.appendChild(shelfEl);
-      });
-    }
-
-    wrapper.appendChild(shelvesWrap);
-    container.appendChild(wrapper);
   }
 
   renderChannelsRow(channelsRow, channels) {
