@@ -23,16 +23,24 @@ class SpatialNavigation {
     // Handle Magic Remote air mouse pointer interactions
     document.addEventListener('mouseover', (e) => {
       const target = e.target.closest('.focusable');
-      if (target && target !== this.currentFocused) {
-        this.setFocus(target, false);
+      if (!target || target === this.currentFocused) return;
+      if (this.app.isModalOpen && this.app.isModalOpen()) {
+        const activeModal = Array.from(document.querySelectorAll('.modal-overlay')).find(m => m.style.display === 'flex');
+        if (activeModal && !activeModal.contains(target)) return;
+      } else if (this.app.player && this.app.player.container.style.display !== 'none') {
+        if (!this.app.player.container.contains(target)) return;
       }
+      this.setFocus(target, false);
     });
 
     document.addEventListener('click', (e) => {
       const target = e.target.closest('.focusable');
-      if (target) {
-        this.setFocus(target, false);
+      if (!target) return;
+      if (this.app.isModalOpen && this.app.isModalOpen()) {
+        const activeModal = Array.from(document.querySelectorAll('.modal-overlay')).find(m => m.style.display === 'flex');
+        if (activeModal && !activeModal.contains(target)) return;
       }
+      this.setFocus(target, false);
     });
 
     // Expand sidebar on hover / pointer
@@ -149,7 +157,7 @@ class SpatialNavigation {
 
       // 1. Center OK Button (Enter / Magic Remote Wheel Click)
       if (key === 13) {
-        if (player.isSeeking) {
+        if (player.isSeeking && player.seekCommitTimer) {
           player.commitSeekNow();
           e.preventDefault();
           return;
@@ -191,7 +199,6 @@ class SpatialNavigation {
           // OSD visible:
           if (this.currentFocused && this.currentFocused.id === 'progress-track') {
             player.seekAccelerated(dir);
-            player.wakeOSD(4500);
           } else {
             // Navigate between control buttons
             const buttons = [

@@ -213,4 +213,37 @@ describe('Spatial Navigation & LG Remote Tests', () => {
         const restored = shelfMemory['shelf_a'];
         assert.equal(restored.id, 'sa3', 'Returning to shelf A must restore card 3 from focus memory');
     });
+
+    test('7. Real SpatialNavigation blocks background mouseover focus leak when modal is open', async () => {
+        const localEnv = setupMockEnvironment();
+        await import('../src/js/navigation.js');
+        const SpatialNavigation = globalThis.SpatialNavigation;
+
+        const sidebar = localEnv.doc.getElementById('sidebar');
+        const bgCard = new MockElement('div', 'bg-card', 'video-card focusable');
+        const modal = new MockElement('div', 'video-context-modal', 'modal-overlay');
+        modal.style.display = 'flex';
+        const modalBtn = new MockElement('button', 'ctx-btn-play', 'option-btn focusable');
+        modal.appendChild(modalBtn);
+
+        localEnv.root.appendChild(sidebar);
+        localEnv.root.appendChild(bgCard);
+        localEnv.root.appendChild(modal);
+
+        const playerContainer = new MockElement('div', 'player-container');
+        playerContainer.style.display = 'none';
+
+        const mockApp = {
+            currentSection: 'home',
+            player: { container: playerContainer },
+            isModalOpen: () => modal.style.display === 'flex'
+        };
+
+        const realNav = new SpatialNavigation(mockApp);
+        realNav.setFocus(modalBtn, false);
+
+        // Background card emits mouseover while modal is open -> must NOT steal focus!
+        localEnv.doc.dispatchEvent({ type: 'mouseover', target: bgCard });
+        assert.equal(realNav.currentFocused, modalBtn, 'Background mouseover must not steal focus from open modal');
+    });
 });

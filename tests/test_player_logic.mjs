@@ -341,3 +341,93 @@ test('VideoPlayer - Displays remaining watch time and never leaks numeric ownerI
 
   player.close();
 });
+
+test('VideoPlayer - wakeOSD and mousemove do not cancel active seek streak or snap progress bar back', async () => {
+  const app = new MockApp();
+  const player = new VideoPlayer(app);
+  let startLoadTarget = null;
+
+  try {
+    player.loadAndPlay({
+      id: '-800_800',
+      title: 'Тест плавной перемотки',
+      streams: { hls: 'https://cdn.vk.com/seek.m3u8' }
+    });
+    player.hls.startLoad = (pos) => { startLoadTarget = pos; };
+    player.video.duration = 1200;
+    player.video.currentTime = 100;
+    player.pendingResumeTime = 100;
+
+    // Trigger progressive seek twice with wakeOSD & mousemove firing between presses
+    player.seekAccelerated(1); // +10s -> 110s
+    player.wakeOSD(4500);
+    win.dispatchEvent({ type: 'mousemove' });
+    assert.equal(player.isSeeking, true, 'wakeOSD and mousemove must NOT clear isSeeking during seek session');
+
+    player.seekAccelerated(1); // streak=2 (+20s) -> 130s
+    assert.equal(player.seekTargetTime, 130, 'Seek streak must accumulate continuously without resetting to 100');
+
+    // timeupdate while seeking must not snap UI preview back to 100s
+    player.onTimeUpdate();
+    assert.equal(player.timeCurrentEl.textContent, '2:10', 'timeupdate must not overwrite preview time while seeking');
+
+    // Commit seek immediately (like pressing OK on OSD)
+    player.commitSeekNow();
+    assert.equal(player.video.currentTime, 130);
+    assert.equal(player.pendingResumeTime, 0, 'Intentional seek commit must clear pendingResumeTime');
+    assert.equal(startLoadTarget, 130, 'Unbuffered commit must trigger hls.startLoad at target position');
+    assert.equal(player.isSeeking, true, 'isSeeking holds briefly until decoder fires seeked');
+
+    // Browser emits seeked -> clears isSeeking
+    player.video.dispatchEvent({ type: 'seeked' });
+    assert.equal(player.isSeeking, false, 'seeked event clears isSeeking cleanly');
+
+    // Direct seekTo clamps cleanly near end of stream
+    player.seekTo(1250);
+    assert.equal(player.video.currentTime, 1199.5, 'seekTo must clamp safely before EOF');
+  } finally {
+    player.close();
+  }
+});
+
+test('VideoPlayer - Throttles timeupdate storage writes and flushes progress cleanly on close', async () => {
+  let saveCalls = 0;
+  let lastSavedArgs = null;
+  let refreshedVideoId = null;
+
+  const app = new MockApp();
+  app.saveWatchProgress = (id, cur, dur) => {
+    saveCalls++;
+    lastSavedArgs = { id, cur, dur };
+  };
+  app.refreshCardProgress = (id) => { refreshedVideoId = id; };
+
+  const player = new VideoPlayer(app);
+  try {
+    player.loadAndPlay({
+      id: '-900_900',
+      title: 'Тест сохранения прогресса',
+      streams: { hls: 'https://cdn.vk.com/prog.m3u8' }
+    });
+    player.video.duration = 1000;
+    player.video.playbackRate = 1.5;
+
+    // Repeated timeupdate ticks within 5s should throttle to 1 write
+    player.video.currentTime = 120;
+    player.onTimeUpdate();
+    player.video.currentTime = 121;
+    player.onTimeUpdate();
+    player.video.currentTime = 122;
+    player.onTimeUpdate();
+    assert.equal(saveCalls, 1, 'Repeated timeupdate ticks within 5s must throttle saveWatchProgress writes');
+
+    // Closing player flushes latest progress, resets playbackRate, and updates card UI
+    player.close();
+    assert.equal(saveCalls, 2, 'Closing player must flush latest watch progress');
+    assert.equal(lastSavedArgs.cur, 122);
+    assert.equal(refreshedVideoId, '-900_900', 'Closing player must refresh card progress bar');
+    assert.equal(player.video.playbackRate, 1.0, 'Closing player must reset playbackRate to 1.0');
+  } finally {
+    player.close();
+  }
+});

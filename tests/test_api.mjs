@@ -1069,3 +1069,91 @@ test('VKApi - getVideoDetails resolves channel name from groups/profiles instead
   const details = await api.getVideoDetails('-220754053_456248219');
   assert.equal(details.author, 'VK Видео');
 });
+
+test('VKApi - getSmartFeed caps concurrent channel/recommendation requests for fast Home loading', async () => {
+  const api = new VKApi();
+  api.setToken('mock_perf_token');
+  const now = Math.floor(Date.now() / 1000);
+  const callCounts = { videoGet: 0, discover: 0, search: 0, blockItemsPages: 0 };
+
+  const manyGroups = Array.from({ length: 120 }, (_, i) => ({
+    id: 5000 + i,
+    name: `Канал Шоу ${i}`,
+    members_count: 100000 - i,
+    verified: 1
+  }));
+
+  api.callMethod = async (method, params) => {
+    if (method === 'groups.get') return { items: manyGroups };
+    if (method === 'fave.getPages') return { items: [] };
+    if (method === 'catalog.getVideoSmartTV') {
+      return { catalog: { sections: [{ id: 's1', title: 'Главная', url: 'https://vkvideo.ru' }] } };
+    }
+    if (method === 'catalog.getSectionBlocksLinks') {
+      return {
+        blocks: [{ block_id: 'b_cw', title: 'Продолжить просмотр' }],
+        first_block_data: { videos: [] }
+      };
+    }
+    if (method === 'catalog.getBlockItems') {
+      callCounts.blockItemsPages++;
+      return {
+        block: { next_from: 'page2_should_skip_on_home' },
+        videos: [
+          { id: 11, owner_id: -5001, title: 'Большое шоу выпуск 10 | Продолжение', duration: 1800, viewed_duration: 200, width: 1920, height: 1080, date: now - 500 }
+        ]
+      };
+    }
+    if (method === 'video.get') {
+      callCounts.videoGet++;
+      return {
+        items: [{ id: 100 + callCounts.videoGet, owner_id: params.owner_id, title: `Выпуск ${callCounts.videoGet}`, duration: 1500, width: 1920, height: 1080, date: now - 300 }]
+      };
+    }
+    if (method === 'video.getVideoDiscover') {
+      callCounts.discover++;
+      return { items: [] };
+    }
+    if (method === 'video.search') {
+      callCounts.search++;
+      return { items: [] };
+    }
+    return { items: [] };
+  };
+
+  const localHistory = Array.from({ length: 10 }, (_, i) => ({
+    id: `-900${i}_1${i}`,
+    title: `Большое шоу комедия выпуск ${i} супер гость`
+  }));
+
+  await api.getSmartFeed(192, localHistory, {});
+  assert.equal(callCounts.blockItemsPages, 1, 'Home getSmartFeed must not wait for 2nd sequential SmartTV history page');
+  assert.ok(callCounts.videoGet <= 36, `Total channel video.get requests must stay bounded (got ${callCounts.videoGet})`);
+  assert.ok(callCounts.discover <= 3, `Discover seed calls must stay bounded (got ${callCounts.discover})`);
+  assert.ok(callCounts.search <= 4, `Semantic search seed calls must stay bounded (got ${callCounts.search})`);
+});
+
+test('VKApi - callMethod does not retry VK rate-limit errors onto fallback api.vk.com', async () => {
+  const api = new VKApi();
+  api.setToken('mock_token');
+  const origFetch = globalThis.fetch;
+  const fetchedUrls = [];
+
+  globalThis.fetch = async (url) => {
+    fetchedUrls.push(String(url));
+    return {
+      ok: true,
+      json: async () => ({ error: { error_code: 6, error_msg: 'Too many requests per second' } })
+    };
+  };
+
+  try {
+    await assert.rejects(
+      () => api.callMethod('video.get', { owner_id: -1 }),
+      /Too many requests per second/
+    );
+    assert.equal(fetchedUrls.length, 1, 'Rate-limit error code 6 must fail fast without doubling load on api.vk.com');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});

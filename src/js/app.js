@@ -210,10 +210,34 @@ class VKVideoApp {
     }
   }
 
-  removeAccount(userId) {
+  escapeHtml(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  removeAccount(userId, triggerBtn = null) {
     const acc = this.accounts.find(a => String(a.id) === String(userId));
     if (!acc) return;
-    if (!confirm(`Удалить профиль «${acc.name}» с этого телевизора?`)) return;
+
+    // 2-step inline confirmation for Smart TV remote (avoids native window.confirm() freeze on webOS)
+    if (triggerBtn && triggerBtn.dataset.confirmPending !== '1') {
+      triggerBtn.dataset.confirmPending = '1';
+      const origText = triggerBtn.textContent;
+      triggerBtn.textContent = 'Подтвердить?';
+      this.showToast(`Нажмите ещё раз, чтобы удалить «${acc.name}»`);
+      setTimeout(() => {
+        if (triggerBtn && triggerBtn.dataset.confirmPending === '1') {
+          triggerBtn.dataset.confirmPending = '0';
+          triggerBtn.textContent = origText;
+        }
+      }, 4000);
+      return;
+    }
 
     this.accounts = this.accounts.filter(a => String(a.id) !== String(userId));
     try {
@@ -222,6 +246,9 @@ class VKVideoApp {
       localStorage.removeItem(`vk_favorites_${userId}`);
       localStorage.removeItem(`vk_watch_progress_${userId}`);
       localStorage.removeItem(`vk_home_feed_cache_auth_v5_user_${userId}`);
+      localStorage.removeItem(`vk_home_feed_cache_auth_v8_user_${userId}`);
+      localStorage.removeItem(`vk_subs_channels_cache_user_${userId}`);
+      localStorage.removeItem(`vk_subs_feed_cache_user_${userId}`);
       localStorage.removeItem(`vk_subscriptions_feed_cache_auth_user_${userId}`);
     } catch (e) {}
 
@@ -247,6 +274,9 @@ class VKVideoApp {
     }
 
     this.renderProfilesList();
+    const modal = document.getElementById('profiles-modal');
+    const nextFocus = (modal && modal.querySelector('.focusable')) || document.getElementById('btn-add-profile');
+    if (nextFocus && this.nav) this.nav.setFocus(nextFocus);
   }
 
   openProfilesModal() {
@@ -283,21 +313,22 @@ class VKVideoApp {
 
     this.accounts.forEach(acc => {
       const isActive = String(acc.id) === String(this.activeUserId);
+      const safeName = this.escapeHtml(acc.name || 'Пользователь VK');
       const row = document.createElement('div');
-      row.className = `profile-item focusable ${isActive ? 'active-profile' : ''}`;
+      row.className = `profile-item ${isActive ? 'active-profile' : ''}`;
       row.dataset.id = acc.id;
 
       const avatarContent = acc.photo
-        ? `<img src="${acc.photo}" alt="${acc.name}">`
-        : `<span>${(acc.name || 'VK').slice(0, 2).toUpperCase()}</span>`;
+        ? `<img src="${this.escapeHtml(acc.photo)}" alt="${safeName}">`
+        : `<span>${this.escapeHtml((acc.name || 'VK').slice(0, 2).toUpperCase())}</span>`;
 
       row.innerHTML = `
         <div class="profile-avatar-wrap">
           ${avatarContent}
         </div>
         <div class="profile-details">
-          <div class="profile-name">${acc.name || 'Пользователь VK'}</div>
-          <div class="profile-subtext">${isActive ? '🟢 Текущий активный профиль' : 'Нажмите для переключения'}</div>
+          <div class="profile-name">${safeName}</div>
+          <div class="profile-subtext">${isActive ? '🟢 Текущий активный профиль' : 'Нажмите «Выбрать» для переключения'}</div>
         </div>
         <div class="profile-actions">
           ${!isActive ? `<button class="profile-action-btn focusable primary" data-action="switch" data-id="${acc.id}">Выбрать</button>` : ''}
@@ -328,7 +359,7 @@ class VKVideoApp {
       if (delBtn) {
         delBtn.addEventListener('click', (e) => {
           e.stopPropagation();
-          this.removeAccount(acc.id);
+          this.removeAccount(acc.id, delBtn);
         });
       }
 
@@ -342,11 +373,15 @@ class VKVideoApp {
       if (document.hidden) {
         if (this.player && this.player.isPlaying) {
           this.player.video.pause();
+          this.player.isPlaying = false;
+          this.player.updatePlayBtn();
+          this.player._flushWatchProgress();
           this.player.wasPlayingBeforeHidden = true;
           this.player.stopPowerKeepAlive();
         }
       } else {
         if (this.player && this.player.wasPlayingBeforeHidden) {
+          this.player.wasPlayingBeforeHidden = false;
           this.player.wakeOSD();
           this.player.startPowerKeepAlive();
         }
@@ -413,10 +448,11 @@ class VKVideoApp {
     // Progress bar click / seek
     document.getElementById('progress-track').addEventListener('click', (e) => {
       const rect = e.currentTarget.getBoundingClientRect();
-      const pos = (e.clientX - rect.left) / rect.width;
-      if (this.player.video.duration) {
-        this.player.video.currentTime = pos * this.player.video.duration;
-        this.player.wakeOSD();
+      if (!rect || !rect.width) return;
+      const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const dur = this.player.getDuration();
+      if (dur > 0) {
+        this.player.seekTo(pos * dur);
       }
     });
 
@@ -438,14 +474,15 @@ class VKVideoApp {
       nameEl.textContent = info.name || 'VK Пользователь';
       statusEl.textContent = this.accounts && this.accounts.length > 1 ? 'Сменить профиль' : 'Авторизован';
       if (info.photo) {
-        avatarEl.innerHTML = `<img src="${info.photo}" alt="Avatar">`;
+        const initials = this.escapeHtml((info.name || 'VK').slice(0, 2).toUpperCase());
+        avatarEl.innerHTML = `<img src="${this.escapeHtml(info.photo)}" alt="Avatar" onerror="this.parentElement.textContent='${initials}'">`;
       } else {
-        avatarEl.innerHTML = (info.name || 'VK').slice(0, 2).toUpperCase();
+        avatarEl.textContent = (info.name || 'VK').slice(0, 2).toUpperCase();
       }
     } else {
       nameEl.textContent = 'Войти по QR';
       statusEl.textContent = 'Гостевой режим 4K';
-      avatarEl.innerHTML = 'VK';
+      avatarEl.textContent = 'VK';
     }
   }
 
@@ -487,8 +524,8 @@ class VKVideoApp {
   }
 
   async loadSection(sectionId) {
+    clearTimeout(this._navSectionTimer);
     this.isNavigatingSection = true;
-    setTimeout(() => { this.isNavigatingSection = false; }, 400);
     this.currentSection = sectionId;
     this.currentChannel = null;
 
@@ -521,7 +558,7 @@ class VKVideoApp {
           this.renderFavorites();
           break;
         case 'history':
-          this.renderHistory();
+          await this.renderHistory();
           break;
         case 'direct':
           this.renderDirectInput();
@@ -530,7 +567,11 @@ class VKVideoApp {
       this.focusCurrentSection();
     } catch (err) {
       console.error('[App] Section load error:', err);
-      contentArea.innerHTML = `<div class="section-title">Ошибка загрузки</div><p style="color:#f85149;margin-top:15px;">${err.message}</p>`;
+      contentArea.innerHTML = `<div class="section-title">Ошибка загрузки</div><p style="color:#f85149;margin-top:15px;">${this.escapeHtml(err.message)}</p>`;
+    } finally {
+      this._navSectionTimer = setTimeout(() => {
+        this.isNavigatingSection = false;
+      }, 200);
     }
   }
 
@@ -647,9 +688,20 @@ class VKVideoApp {
           } catch (e) {}
 
           if (this.currentSection === 'home') {
-            grid.innerHTML = '';
-            this.renderVideoCards(grid, freshVideos);
-            this.focusCurrentSection();
+            const userScrolled = grid && grid.scrollTop > 80;
+            const modalOrPlayerActive = this.isModalOpen() || (this.player && this.player.container.style.display !== 'none');
+            if (!hasRenderedCache || (!userScrolled && !modalOrPlayerActive)) {
+              const prevFocusedId = (this.nav && this.nav.currentFocused && this.nav.currentFocused.dataset) ? this.nav.currentFocused.dataset.id : null;
+              grid.innerHTML = '';
+              this.renderVideoCards(grid, freshVideos);
+              if (prevFocusedId) {
+                const sameCard = grid.querySelector(`.video-card[data-id="${prevFocusedId}"]`);
+                if (sameCard && this.nav) this.nav.setFocus(sameCard, false);
+                else this.focusCurrentSection();
+              } else {
+                this.focusCurrentSection();
+              }
+            }
           }
         }
       } catch (err) {
@@ -668,9 +720,10 @@ class VKVideoApp {
         const chip = document.createElement('div');
         chip.className = 'channel-chip focusable';
         chip.dataset.id = ch.id;
+        const safeChName = this.escapeHtml(ch.name || 'Канал');
         chip.innerHTML = `
-          <img class="channel-chip-avatar" src="${ch.avatar}" alt="${ch.name}" onerror="this.src='assets/icon.png'">
-          <span class="channel-chip-name" title="${ch.name}">${ch.name}</span>
+          <img class="channel-chip-avatar" src="${this.escapeHtml(ch.avatar || 'assets/icon.png')}" alt="${safeChName}" onerror="this.src='assets/icon.png'">
+          <span class="channel-chip-name" title="${safeChName}">${safeChName}</span>
         `;
         chip.addEventListener('click', () => {
           this.renderChannel(ch.id, ch.name);
@@ -785,14 +838,18 @@ class VKVideoApp {
         } catch (e) {}
 
         if (this.currentSection === 'subscriptions') {
-          this.renderChannelsRow(channelsRow, channels);
-          feedGrid.innerHTML = '';
-          if (feedVideos && feedVideos.length > 0) {
-            this.renderVideoCards(feedGrid, feedVideos);
-          } else {
-            feedGrid.innerHTML = '<div style="color:var(--text-muted); font-size: 22px; padding: 30px;">В ленте подписок пока нет новых длинных видео</div>';
+          const userScrolled = feedGrid && feedGrid.scrollTop > 80;
+          const modalOrPlayerActive = this.isModalOpen() || (this.player && this.player.container.style.display !== 'none');
+          if (!hasRenderedCache || (!userScrolled && !modalOrPlayerActive)) {
+            this.renderChannelsRow(channelsRow, channels);
+            feedGrid.innerHTML = '';
+            if (feedVideos && feedVideos.length > 0) {
+              this.renderVideoCards(feedGrid, feedVideos);
+            } else {
+              feedGrid.innerHTML = '<div style="color:var(--text-muted); font-size: 22px; padding: 30px;">В ленте подписок пока нет новых длинных видео</div>';
+            }
+            this.focusCurrentSection();
           }
-          this.focusCurrentSection();
         }
       } catch (err) {
         console.error('[App] Subscriptions load error:', err);
@@ -833,32 +890,51 @@ class VKVideoApp {
     `;
 
     document.querySelectorAll('.cat-card').forEach(card => {
-      card.addEventListener('click', async () => {
+      card.addEventListener('click', () => {
         const catId = card.dataset.cat;
         const catTitle = card.querySelector('div:last-child').textContent;
-        this.currentCategory = catId;
-        content.innerHTML = `
-          <div class="section-header">
-            <div class="section-title">
-              <span>Категория: ${catTitle}</span>
-              <button class="player-btn focusable" id="cat-back-btn" style="font-size: 16px; padding: 6px 16px; margin-left: 15px;">⬅ Назад к категориям</button>
-            </div>
-            <div class="section-subtitle">Полноформатные видео в высоком разрешении без коротких клипов</div>
-          </div>
-          <div class="video-grid" id="video-grid"></div>
-        `;
-        document.getElementById('cat-back-btn').addEventListener('click', () => {
-          this.renderCategories();
-          this.focusCurrentSection();
-        });
-        const grid = document.getElementById('video-grid');
-        this.renderSkeletons(grid, 8);
-        const videos = await this.api.getCategory(catId);
-        grid.innerHTML = '';
-        this.renderVideoCards(grid, videos);
-        this.focusCurrentSection();
+        this.selectCategory(catId, catTitle);
       });
     });
+  }
+
+  async selectCategory(catId, catTitle = null) {
+    const titles = {
+      movies: 'Фильмы 4K',
+      series: 'Сериалы',
+      shows: 'Шоу и Передачи',
+      games: 'Игры и Гейминг',
+      tech: 'Технологии и Гаджеты',
+      nature: 'Природа 4K Relax',
+      kids: 'Детям и Мультфильмы',
+      music: 'Музыка и Клипы 4K'
+    };
+    const resolvedTitle = catTitle || titles[catId] || 'Категория';
+    this.currentCategory = catId;
+    const content = document.getElementById('main-content');
+    content.innerHTML = `
+      <div class="section-header">
+        <div class="section-title">
+          <span>Категория: ${this.escapeHtml(resolvedTitle)}</span>
+          <button class="player-btn focusable" id="cat-back-btn" style="font-size: 16px; padding: 6px 16px; margin-left: 15px;">⬅ Назад к категориям</button>
+        </div>
+        <div class="section-subtitle">Полноформатные видео в высоком разрешении без коротких клипов</div>
+      </div>
+      <div class="video-grid" id="video-grid"></div>
+    `;
+    document.getElementById('cat-back-btn').addEventListener('click', () => {
+      this.currentCategory = null;
+      this.renderCategories();
+      this.focusCurrentSection();
+    });
+    const grid = document.getElementById('video-grid');
+    this.renderSkeletons(grid, 8);
+    const videos = await this.api.getCategory(catId);
+    if (this.currentSection === 'categories' && this.currentCategory === catId) {
+      grid.innerHTML = '';
+      this.renderVideoCards(grid, videos);
+      this.focusCurrentSection();
+    }
   }
 
   normalizeVoiceQuery(raw) {
@@ -957,7 +1033,7 @@ class VKVideoApp {
 
         <div class="tv-keyboard" id="tv-keyboard" style="display:none;"></div>
 
-        <div class="video-grid" id="search-results-grid" style="flex: 1; min-height: 400px; overflow-y: auto;"></div>
+        <div class="video-grid" id="search-results-grid" style="flex: 1; min-height: 0; overflow-y: auto;"></div>
       </div>
     `;
 
@@ -999,10 +1075,11 @@ class VKVideoApp {
         triggerSearchFromInput();
       });
 
-      // Pressing OK / Enter executes the search immediately
+      // Pressing OK / Enter executes the search immediately (stopPropagation avoids double-clicking input via navigation.js)
       searchInput.addEventListener('keydown', (e) => {
         if (e.keyCode === 13) {
           e.preventDefault();
+          e.stopPropagation();
           triggerSearchFromInput();
         }
       });
@@ -1029,6 +1106,11 @@ class VKVideoApp {
       if (kb) {
         const isHidden = kb.style.display === 'none';
         kb.style.display = isHidden ? 'flex' : 'none';
+        if (quickTagsSec) {
+          const gridEl = document.getElementById('search-results-grid');
+          const hasResults = gridEl && gridEl.querySelector('.video-card');
+          quickTagsSec.style.display = (!isHidden && !hasResults) ? 'flex' : 'none';
+        }
         if (isHidden) {
           const firstKey = kb.querySelector('.kb-key');
           if (firstKey) this.nav.setFocus(firstKey);
@@ -1104,6 +1186,8 @@ class VKVideoApp {
     });
 
     document.getElementById('kb-do-search').addEventListener('click', () => {
+      this.searchQuery = this.normalizeVoiceQuery(this.searchQuery);
+      this.updateSearchInput();
       this.executeSearch();
     });
   }
@@ -1140,15 +1224,20 @@ class VKVideoApp {
     this.showToast(`Поиск: "${this.searchQuery}"`);
 
     const results = await this.api.search(this.searchQuery, 60);
+    if (this.currentSection !== 'search') return;
     grid.innerHTML = '';
     if (!results || results.length === 0) {
       grid.innerHTML = `
-        <div style="font-size: 24px; color:#8b949e; padding: 40px 10px;">
-          По запросу «${this.searchQuery}» видео не найдено. Нажмите «Очистить», чтобы выбрать тренды.
+        <div style="font-size: 24px; color:#8b949e; padding: 20px 10px; grid-column: 1 / -1;">
+          По запросу «${this.escapeHtml(this.searchQuery)}» видео не найдено. Выберите тренд или уточните запрос.
         </div>
       `;
       if (quickTagsSec) quickTagsSec.style.display = 'flex';
-      if (kb) kb.style.display = 'flex';
+      if (kb) kb.style.display = 'none';
+      const firstTag = quickTagsSec && quickTagsSec.querySelector('.quick-tag');
+      const searchInput = document.getElementById('search-real-input');
+      if (firstTag && this.nav) this.nav.setFocus(firstTag);
+      else if (searchInput && this.nav) this.nav.setFocus(searchInput);
     } else {
       this.renderVideoCards(grid, results);
       this.showToast(`Найдено ${results.length} видео`);
@@ -1220,19 +1309,32 @@ class VKVideoApp {
       </div>
     `;
 
-    document.getElementById('demo-4k-btn').addEventListener('click', () => {
-      document.getElementById('direct-input').value = '-22822305_456241859';
-      this.showToast('Вставлен демо-ID');
-    });
-
-    document.getElementById('direct-play-btn').addEventListener('click', async () => {
-      const val = document.getElementById('direct-input').value.trim();
+    const directInput = document.getElementById('direct-input');
+    const launchDirect = () => {
+      const val = directInput ? directInput.value.trim() : '';
       if (!val) {
         this.showToast('Введите ссылку или ID');
         return;
       }
       this.playByDirectId(val);
+    };
+
+    if (directInput) {
+      directInput.addEventListener('keydown', (e) => {
+        if (e.keyCode === 13) {
+          e.preventDefault();
+          e.stopPropagation();
+          launchDirect();
+        }
+      });
+    }
+
+    document.getElementById('demo-4k-btn').addEventListener('click', () => {
+      if (directInput) directInput.value = '-22822305_456241859';
+      this.showToast('Вставлен демо-ID');
     });
+
+    document.getElementById('direct-play-btn').addEventListener('click', launchDirect);
   }
 
   async playByDirectId(input) {
@@ -1241,13 +1343,7 @@ class VKVideoApp {
     if (match) {
       videoId = match[1];
     }
-    this.showToast('Загрузка видеопотока 4K...');
-    try {
-      const details = await this.api.getVideoDetails(videoId);
-      this.player.loadAndPlay(details);
-    } catch (err) {
-      this.showToast(`Ошибка: ${err.message}`);
-    }
+    return this.launchVideoById(videoId);
   }
 
   renderFavorites() {
@@ -1272,22 +1368,23 @@ class VKVideoApp {
     const content = document.getElementById('main-content');
     const isAuth = this.api.isAuthorized();
     content.innerHTML = `
-      <div class="section-header">
+      <div class="section-header section-header-row">
         <div>
           <div class="section-title">История просмотров</div>
           ${isAuth ? '<div class="section-subtitle">Синхронизирована с вашим аккаунтом VK Видео (ТВ, телефон и ПК)</div>' : ''}
         </div>
-        <button class="player-btn focusable" id="clear-hist-btn" style="font-size:16px;">Очистить локальную</button>
+        <button class="player-btn focusable" id="clear-hist-btn" style="font-size:16px; flex-shrink:0;">Очистить локальную</button>
       </div>
       <div class="video-grid" id="video-grid"></div>
     `;
 
     const clearBtn = document.getElementById('clear-hist-btn');
     if (clearBtn) {
-      clearBtn.addEventListener('click', () => {
+      clearBtn.addEventListener('click', async () => {
         this.history = [];
         this.saveUserScopedData('history', []);
-        this.renderHistory();
+        await this.renderHistory();
+        this.focusCurrentSection();
         this.showToast('Локальная история очищена');
       });
     }
@@ -1384,12 +1481,17 @@ class VKVideoApp {
     const blankGif = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
     const initialThumb = (isTopViewport || !this.thumbnailObserver) ? video.thumbnail : blankGif;
 
+    const safeTitle = this.escapeHtml(video.title || 'Видео');
+    const safeAuthor = this.escapeHtml(video.author || 'Канал');
+    const safeThumb = this.escapeHtml(initialThumb || '');
+    const safeDataSrc = this.escapeHtml(video.thumbnail || '');
+
     card.innerHTML = `
         <div class="card-thumb-wrap">
           <img class="card-thumb" 
-               src="${initialThumb}" 
-               data-src="${video.thumbnail}"
-               alt="${video.title}" 
+               src="${safeThumb}" 
+               data-src="${safeDataSrc}"
+               alt="${safeTitle}" 
                decoding="async" 
                ${isTopViewport ? 'loading="eager" fetchpriority="high"' : 'loading="lazy"'} 
                onerror="this.src='assets/splashBackground.png'">
@@ -1399,16 +1501,16 @@ class VKVideoApp {
             ${video.is4K && !video.isLive ? '<span class="badge-overlay-4k">4K UHD</span>' : ''}
             ${video.isHD && !video.is4K && !video.isLive ? '<span class="badge-overlay-fhd">1080p</span>' : ''}
           </div>
-          <span class="duration-badge">${video.isLive ? 'В ЭФИРЕ' : video.duration}</span>
+          <span class="duration-badge">${video.isLive ? 'В ЭФИРЕ' : this.escapeHtml(video.duration)}</span>
           ${progressPercent > 2 ? `<div class="card-progress-bar"><div class="card-progress-fill" style="width: ${progressPercent}%"></div></div>` : ''}
         </div>
         <div class="card-body">
-          <div class="card-title" title="${video.title}">${video.title}</div>
+          <div class="card-title" title="${safeTitle}">${safeTitle}</div>
           <div class="card-meta">
-            <span class="card-author">${video.author}</span>
+            <span class="card-author">${safeAuthor}</span>
             <div class="card-meta-right">
-              <span>${video.views}</span>
-              ${dateStr ? `<span class="meta-dot">•</span><span class="card-date">${dateStr}</span>` : ''}
+              <span>${this.escapeHtml(video.views)}</span>
+              ${dateStr ? `<span class="meta-dot">•</span><span class="card-date">${this.escapeHtml(dateStr)}</span>` : ''}
             </div>
           </div>
         </div>
@@ -1453,24 +1555,55 @@ class VKVideoApp {
         this.openVideoContextMenu(video);
       });
 
-      card.addEventListener('click', async (e) => {
+      card.addEventListener('click', (e) => {
         if (isLongPressed) {
           e.preventDefault();
           e.stopPropagation();
           return;
         }
-        this.showToast('Загрузка видеопотока 4K...');
-        try {
-          const details = await this.api.getVideoDetails(video.id);
-          if (!details.author && video.author) details.author = video.author;
-          this.player.loadAndPlay(details);
-        } catch (err) {
-          console.error('[App] Play error:', err);
-          this.showToast(`Ошибка: ${err.message}`);
-        }
+        this.launchVideoById(video.id, video.author);
       });
 
     return card;
+  }
+
+  async launchVideoById(videoId, fallbackAuthor = '') {
+    if (!videoId) return;
+    const reqId = (this._playRequestId = (this._playRequestId || 0) + 1);
+    this.showToast('Загрузка видеопотока 4K...');
+    try {
+      const details = await this.api.getVideoDetails(videoId);
+      if (reqId !== this._playRequestId) return;
+      if (!details.author && fallbackAuthor) details.author = fallbackAuthor;
+      this.player.loadAndPlay(details);
+    } catch (err) {
+      if (reqId !== this._playRequestId) return;
+      console.error('[App] Play error:', err);
+      this.showToast(`Ошибка: ${err.message}`);
+    }
+  }
+
+  refreshCardProgress(videoId) {
+    if (!videoId) return;
+    const progress = this.watchProgress[videoId];
+    const pct = (progress && progress.percent > 2) ? progress.percent : 0;
+    document.querySelectorAll(`.video-card[data-id="${videoId}"]`).forEach(card => {
+      const wrap = card.querySelector('.card-thumb-wrap');
+      if (!wrap) return;
+      let bar = wrap.querySelector('.card-progress-bar');
+      if (pct > 2) {
+        if (!bar) {
+          bar = document.createElement('div');
+          bar.className = 'card-progress-bar';
+          bar.innerHTML = '<div class="card-progress-fill"></div>';
+          wrap.appendChild(bar);
+        }
+        const fill = bar.querySelector('.card-progress-fill');
+        if (fill) fill.style.width = `${pct}%`;
+      } else if (bar) {
+        bar.remove();
+      }
+    });
   }
 
   renderVideoCards(container, list) {
@@ -1748,17 +1881,10 @@ class VKVideoApp {
       this.renderChannel(ownerId, video.author);
     };
 
-    btnPlay.onclick = async (e) => {
+    btnPlay.onclick = (e) => {
       if (!canClick()) return;
       this.closeAllModals();
-      this.showToast('Загрузка видеопотока 4K...');
-      try {
-        const details = await this.api.getVideoDetails(video.id);
-        if (!details.author && video.author) details.author = video.author;
-        this.player.loadAndPlay(details);
-      } catch (err) {
-        this.showToast(`Ошибка: ${err.message}`);
-      }
+      this.launchVideoById(video.id, video.author);
     };
 
     btnFav.onclick = (e) => {
@@ -1803,11 +1929,12 @@ class VKVideoApp {
       previousSection: this.currentSection || 'home'
     };
 
+    const safeChannel = this.escapeHtml(channelName || 'Канал');
     const content = document.getElementById('main-content');
     content.innerHTML = `
       <div class="section-header">
         <div class="section-title">
-          <span>📺 Канал: ${channelName}</span>
+          <span>📺 Канал: ${safeChannel}</span>
           <button class="player-btn focusable" id="channel-back-btn" style="font-size: 16px; padding: 6px 16px; margin-left: 15px;">⬅ Назад</button>
         </div>
         <div class="section-subtitle">Полноформатные видео канала без рекламы и шортсов</div>
@@ -1825,6 +1952,11 @@ class VKVideoApp {
 
     try {
       const videos = await this.api.getChannelVideos(ownerId, 40, channelName, 240);
+      if (!this.currentChannel || String(this.currentChannel.ownerId) !== String(ownerId)) return;
+      if ((!channelName || channelName === 'Канал') && videos && videos.length > 0 && videos[0].author) {
+        const titleSpan = content.querySelector('.section-title span');
+        if (titleSpan) titleSpan.textContent = `📺 Канал: ${videos[0].author}`;
+      }
       grid.innerHTML = '';
       if (!videos || videos.length === 0) {
         grid.innerHTML = '<div style="color:var(--text-muted); font-size:22px; padding:30px;">На этом канале нет доступных длинных видео</div>';
@@ -1833,7 +1965,7 @@ class VKVideoApp {
       }
       this.focusCurrentSection();
     } catch (err) {
-      grid.innerHTML = `<div style="color:var(--danger-color); font-size:22px; padding:30px;">Ошибка загрузки видео канала: ${err.message}</div>`;
+      grid.innerHTML = `<div style="color:var(--danger-color); font-size:22px; padding:30px;">Ошибка загрузки видео канала: ${this.escapeHtml(err.message)}</div>`;
     }
   }
 
@@ -2103,6 +2235,7 @@ class VKVideoApp {
   }
 
   handleBack() {
+    this._playRequestId = (this._playRequestId || 0) + 1;
     if (this.isModalOpen()) {
       this.closeAllModals();
       return;
@@ -2127,11 +2260,21 @@ class VKVideoApp {
       this.focusCurrentSection();
       return;
     }
-    // If on search screen with active query or results, Back clears search and restores trending cloud first!
+    // If on search screen: close on-screen keyboard first, otherwise clear search and restore trending cloud
     if (this.currentSection === 'search') {
       const searchInput = document.getElementById('search-real-input');
       const resultsGrid = document.getElementById('search-results-grid');
       const quickTagsSec = document.getElementById('quick-tags-section');
+      const kb = document.getElementById('tv-keyboard');
+      if (kb && kb.style.display !== 'none') {
+        kb.style.display = 'none';
+        const hasResults = resultsGrid && resultsGrid.querySelector('.video-card');
+        if (!hasResults && quickTagsSec) quickTagsSec.style.display = 'flex';
+        const toggleBtn = document.getElementById('toggle-kb-btn');
+        if (toggleBtn) this.nav.setFocus(toggleBtn);
+        else if (searchInput) this.nav.setFocus(searchInput);
+        return;
+      }
       if (this.searchQuery || (resultsGrid && resultsGrid.children.length > 0)) {
         this.searchQuery = '';
         if (searchInput) {
@@ -2140,8 +2283,6 @@ class VKVideoApp {
         }
         if (resultsGrid) resultsGrid.innerHTML = '';
         if (quickTagsSec) quickTagsSec.style.display = 'flex';
-        const kb = document.getElementById('tv-keyboard');
-        if (kb) kb.style.display = 'none';
         return;
       }
     }
@@ -2208,6 +2349,7 @@ class VKVideoApp {
 
   focusCurrentSection() {
     setTimeout(() => {
+      if (this.isModalOpen() || (this.player && this.player.container.style.display !== 'none')) return;
       const activeNav = document.querySelector('.nav-item.active');
       if (this.nav && this.nav.currentFocused && document.getElementById('sidebar').contains(this.nav.currentFocused)) {
         if (!this.isNavigatingSection) return;

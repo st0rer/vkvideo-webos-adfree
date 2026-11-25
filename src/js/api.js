@@ -223,6 +223,19 @@ class VKApi {
     return null;
   }
 
+  async _fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+    if (typeof AbortController === 'undefined') {
+      return fetch(url, options);
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /**
    * Generic VK API Call (with Smart TV Proxy & Global SSL)
    */
@@ -234,30 +247,34 @@ class VKApi {
       ...(token ? { access_token: token } : {})
     });
 
+    const headers = {
+      'User-Agent': 'VKVideoSmartTV/1.0 (webOS 6.0; LG C1)'
+    };
+
     const primaryUrl = `${this.apiBase}/${method}?${queryParams.toString()}`;
     try {
-      const resp = await fetch(primaryUrl, {
-        headers: {
-          'User-Agent': 'VKVideoSmartTV/1.0 (webOS 6.0; LG C1)'
-        }
-      });
+      const resp = await this._fetchWithTimeout(primaryUrl, { headers }, 8000);
       if (resp.ok) {
         const data = await resp.json();
         if (!data.error) return data.response;
+        const code = Number(data.error.error_code);
+        // Do not amplify rate limits (6) or permanent auth/privacy/param errors onto api.vk.com
+        if ([5, 6, 15, 18, 100, 200].includes(code)) {
+          throw new Error(`VK API Error: ${data.error.error_msg} (code: ${data.error.error_code})`);
+        }
         // If method restricted on proxy, continue to fallback
         console.warn(`[VKApi] Proxy API returned error:`, data.error);
       }
     } catch (e) {
+      if (e && typeof e.message === 'string' && e.message.startsWith('VK API Error:')) {
+        throw e;
+      }
       console.warn(`[VKApi] Primary proxy ${this.apiBase} unreachable, trying fallback:`, e);
     }
 
     // Fallback directly to api.vk.com
     const fallbackUrl = `${this.apiFallback}/${method}?${queryParams.toString()}`;
-    const fbResp = await fetch(fallbackUrl, {
-      headers: {
-        'User-Agent': 'VKVideoSmartTV/1.0 (webOS 6.0; LG C1)'
-      }
-    });
+    const fbResp = await this._fetchWithTimeout(fallbackUrl, { headers }, 8000);
 
     if (!fbResp.ok) {
       throw new Error(`HTTP Error ${fbResp.status}`);
@@ -1612,9 +1629,9 @@ class VKApi {
    * Fetch VK's native "Similar / Discover" recommendations for recent watched videos
    * using video.getVideoDiscover.
    */
-  async getVideoDiscoverRecommendations(seedVideos = [], excludedIds = new Set(), perSeedCount = 8) {
+  async getVideoDiscoverRecommendations(seedVideos = [], excludedIds = new Set(), perSeedCount = 8, maxSeeds = 3) {
     if (!Array.isArray(seedVideos) || seedVideos.length === 0) return [];
-    const seeds = seedVideos.filter(v => v && v.id && v.id.includes('_')).slice(0, 5);
+    const seeds = seedVideos.filter(v => v && v.id && v.id.includes('_')).slice(0, maxSeeds);
     if (seeds.length === 0) return [];
 
     try {
@@ -1758,12 +1775,12 @@ class VKApi {
         }
       }
 
-      const premierPromises = targetChannels.slice(0, 18).map(ch =>
+      const premierPromises = targetChannels.slice(0, 8).map(ch =>
         this.getChannelVideos(ch.id, 6, ch.name, 240).catch(() => [])
       );
 
       // B. Semantic seed searches from user history (for personalized affinity discovery)
-      const seedPromises = seeds.slice(0, 8).map(seed =>
+      const seedPromises = seeds.slice(0, 4).map(seed =>
         this.callMethod('video.search', {
           q: seed,
           count: 8,
@@ -2387,7 +2404,7 @@ class VKApi {
           type: 'groups',
           count: 50
         }).catch(() => ({ items: [] })),
-        this.getSmartTVServerContext(false, 40).catch(() => ({ watchHistory: [], personalFeedVideos: [], serverProgress: {} }))
+        this.getSmartTVServerContext(false, 20).catch(() => ({ watchHistory: [], personalFeedVideos: [], serverProgress: {} }))
       ]);
 
       const stopWords = [
@@ -2468,9 +2485,9 @@ class VKApi {
         return scoreB - scoreA;
       });
 
-      // 2. Concurrently fetch fresh full videos from top 80 channels AND 4x smart personalized recommendations
+      // 2. Concurrently fetch fresh full videos from top 28 channels AND smart personalized recommendations
       // Using minDuration = 240s (4 minutes) to strictly eliminate short clips, teasers, and looping videos
-      const topChannelsToQuery = rankedChannels.slice(0, 80);
+      const topChannelsToQuery = rankedChannels.slice(0, 28);
       const channelPromises = topChannelsToQuery.map(ch =>
         this.getChannelVideos(-ch.id, 10, ch.name, 240).catch(() => [])
       );
@@ -2660,7 +2677,7 @@ class VKApi {
           count: 150,
           fields: 'activity,members_count,verified,description'
         }).catch(() => ({ items: [] })),
-        this.getSmartTVServerContext(false, 40).catch(() => ({ watchHistory: [], personalFeedVideos: [], serverProgress: {} }))
+        this.getSmartTVServerContext(false, 20).catch(() => ({ watchHistory: [], personalFeedVideos: [], serverProgress: {} }))
       ]);
 
       const effectiveHistory = this.mergeHistories(localHistory, serverCtx.watchHistory || []);

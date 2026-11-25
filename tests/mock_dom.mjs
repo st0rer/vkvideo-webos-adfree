@@ -124,6 +124,15 @@ export class MockElement {
     traverse(this);
     return results;
   }
+
+  contains(node) {
+    let curr = node;
+    while (curr) {
+      if (curr === this) return true;
+      curr = curr.parentElement;
+    }
+    return false;
+  }
 }
 
 export class MockLocalStorage {

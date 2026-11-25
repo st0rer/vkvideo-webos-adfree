@@ -66,6 +66,9 @@ class VideoPlayer {
     this.isSeeking = false;
     this.seekBaseTime = 0;
     this.seekTargetTime = 0;
+    this.lastReturnFocusEl = null;
+    this.pendingCloseTimer = null;
+    this._lastProgressSaveMs = 0;
 
     this.bindEvents();
   }
@@ -108,6 +111,13 @@ class VideoPlayer {
       this.seekTargetTime = this.seekBaseTime;
     }
 
+    // Cancel pending resume/safety timers so intentional seek never snaps back
+    this.pendingResumeTime = 0;
+    if (this.seekSafetyTimer) {
+      clearTimeout(this.seekSafetyTimer);
+      this.seekSafetyTimer = null;
+    }
+
     this.lastSeekTime = now;
 
     // Fast progressive ladder: 10s -> 20s -> 30s -> 60s -> 120s -> 180s
@@ -120,19 +130,15 @@ class VideoPlayer {
 
     // Compute target continuously from seekTargetTime (zero glitching when reversing direction)
     this.seekTargetTime = Math.max(0, Math.min(dur, this.seekTargetTime + direction * step));
-    const targetPct = dur > 0 ? (this.seekTargetTime / dur) * 100 : 0;
+    this._updateSeekPreviewUI(this.seekTargetTime, dur);
 
-    // 1. Visually update seekbar & progress thumb in real time so user clearly sees where they are scrubbing
-    const remainingSec = Math.max(0, dur - this.seekTargetTime);
-    if (this.progressBar) this.progressBar.style.width = `${targetPct}%`;
-    if (this.thumb) this.thumb.style.left = `${targetPct}%`;
-    if (this.timeCurrentEl) this.timeCurrentEl.textContent = this.formatTime(this.seekTargetTime);
-    if (this.timeTotalEl) this.timeTotalEl.textContent = this.formatTime(dur);
-    if (this.timeRemainingEl) this.timeRemainingEl.textContent = dur > 1 ? `(-${this.formatTime(remainingSec)})` : '';
-
-    // 2. Visually reveal seekbar HUD when full OSD is hidden
-    if (this.osd && this.osd.classList.contains('hidden')) {
-      this.osd.classList.add('seeking');
+    // 2. Visually reveal seekbar HUD when full OSD is hidden, or refresh auto-hide timer without breaking seek state
+    if (this.osd) {
+      if (this.osd.classList.contains('hidden')) {
+        this.osd.classList.add('seeking');
+      } else {
+        this.wakeOSD(4500);
+      }
     }
 
     // 3. Show sleek central seek bubble with relative delta from seekBaseTime
@@ -151,12 +157,57 @@ class VideoPlayer {
     }, 650);
   }
 
+  _updateSeekPreviewUI(targetSec, dur) {
+    const targetPct = dur > 0 ? Math.max(0, Math.min(100, (targetSec / dur) * 100)) : 0;
+    const remainingSec = Math.max(0, dur - targetSec);
+    if (this.progressBar) this.progressBar.style.width = `${targetPct}%`;
+    if (this.thumb) this.thumb.style.left = `${targetPct}%`;
+    if (this.timeCurrentEl) this.timeCurrentEl.textContent = this.formatTime(targetSec);
+    if (this.timeTotalEl) this.timeTotalEl.textContent = this.formatTime(dur);
+    if (this.timeRemainingEl) this.timeRemainingEl.textContent = dur > 1 ? `(-${this.formatTime(remainingSec)})` : '';
+  }
+
+  _isTimeBuffered(targetSec) {
+    if (!this.video || !this.video.buffered || typeof this.video.buffered.length !== 'number') return false;
+    try {
+      for (let i = 0; i < this.video.buffered.length; i++) {
+        if (targetSec >= this.video.buffered.start(i) && targetSec <= this.video.buffered.end(i)) {
+          return true;
+        }
+      }
+    } catch (e) {}
+    return false;
+  }
+
   commitSeekNow() {
     if (this.seekCommitTimer) {
       clearTimeout(this.seekCommitTimer);
       this.seekCommitTimer = null;
     }
-    const finalTarget = this.seekTargetTime;
+    this.commitSeekTo(this.seekTargetTime);
+  }
+
+  commitSeekTo(target) {
+    const dur = this.getDuration();
+    const maxSeek = dur > 1 ? Math.max(0, dur - 0.5) : dur;
+    const finalTarget = maxSeek > 0 ? Math.max(0, Math.min(maxSeek, Number(target) || 0)) : Math.max(0, Number(target) || 0);
+
+    this.isSeeking = true;
+    this.seekStreak = 0;
+    this.lastSeekTime = 0;
+    this.lastProgressTime = finalTarget;
+
+    if (this.video && this.video.readyState === 0) {
+      this.pendingResumeTime = finalTarget;
+    } else {
+      this.pendingResumeTime = 0;
+    }
+
+    const buffered = this._isTimeBuffered(finalTarget);
+    if (!buffered && this.video && !this.video.paused) {
+      this.showBuffering(true);
+    }
+
     if (this.video) {
       try {
         this.video.currentTime = finalTarget;
@@ -164,17 +215,47 @@ class VideoPlayer {
         console.warn('[Player] currentTime set error:', e);
       }
     }
-    this.seekStreak = 0;
-    this.lastSeekTime = 0;
+
+    // Ensure HLS.js promptly fetches segments for unbuffered or paused seeks on webOS
+    if (this.hls && typeof this.hls.startLoad === 'function' && (!buffered || (this.video && this.video.paused))) {
+      try {
+        this.hls.startLoad(finalTarget);
+      } catch (e) {}
+    }
+
+    if (this.video && !this.video.paused) {
+      this.scheduleStallWatchdog();
+    }
 
     if (this.osd) this.osd.classList.remove('seeking');
     if (this.seekBubble) this.seekBubble.style.display = 'none';
 
-    // Keep this.isSeeking true for 350ms to allow decoder to settle
+    // Hold isSeeking until seeked fires (with fallback timer if browser omits seeked)
     clearTimeout(this.seekSafetyTimer);
     this.seekSafetyTimer = setTimeout(() => {
-      this.isSeeking = false;
-    }, 350);
+      this.seekSafetyTimer = null;
+      if (!this.seekCommitTimer) {
+        this.isSeeking = false;
+      }
+    }, 1500);
+  }
+
+  seekTo(targetSeconds) {
+    if (!this.video || (this.currentVideo && this.currentVideo.isLive)) return;
+    const dur = this.getDuration();
+    if (!dur || dur <= 0) return;
+
+    clearTimeout(this.seekCommitTimer);
+    this.seekCommitTimer = null;
+    clearTimeout(this.seekSafetyTimer);
+    this.seekSafetyTimer = null;
+
+    const clamped = Math.max(0, Math.min(Math.max(0, dur - 0.5), Number(targetSeconds) || 0));
+    this.seekBaseTime = clamped;
+    this.seekTargetTime = clamped;
+    this._updateSeekPreviewUI(clamped, dur);
+    this.commitSeekTo(clamped);
+    this.wakeOSD(4500);
   }
 
   seekProgressive(step) {
@@ -327,6 +408,8 @@ class VideoPlayer {
     });
     this.video.addEventListener('seeked', () => {
       if (!this.seekCommitTimer) {
+        clearTimeout(this.seekSafetyTimer);
+        this.seekSafetyTimer = null;
         this.isSeeking = false;
       }
       if (this.video && this.video.readyState >= 3) {
@@ -342,8 +425,12 @@ class VideoPlayer {
     this.video.addEventListener('ended', () => this.onEnded());
     this.video.addEventListener('error', (e) => this.onError(e));
 
-    // Reset OSD timeout on mouse/pointer movement
-    window.addEventListener('mousemove', () => this.wakeOSD());
+    // Reset OSD timeout on mouse/pointer movement unless actively seeking
+    window.addEventListener('mousemove', () => {
+      if (!this.isSeeking) {
+        this.wakeOSD();
+      }
+    });
   }
 
   /**
@@ -352,6 +439,8 @@ class VideoPlayer {
   async loadAndPlay(videoData) {
     this.playbackSessionId++;
     this.clearStallWatchdog();
+    clearTimeout(this.pendingCloseTimer);
+    this.pendingCloseTimer = null;
     clearTimeout(this.seekCommitTimer);
     clearTimeout(this.seekSafetyTimer);
     this.seekCommitTimer = null;
@@ -362,8 +451,22 @@ class VideoPlayer {
     this.stallRecoveryAttempts = 0;
     this.dropToastShown = false;
     this.lastProgressTime = 0;
+    this._lastProgressSaveMs = 0;
 
     this.currentVideo = videoData;
+
+    // Remember the exact focused card/button in #main-content to restore scroll & focus on player close
+    this.lastReturnFocusEl = null;
+    const mainEl = document.getElementById('main-content');
+    if (this.app.nav && this.app.nav.currentFocused && mainEl && mainEl.contains(this.app.nav.currentFocused)) {
+      this.lastReturnFocusEl = this.app.nav.currentFocused;
+    }
+
+    if (this.video) {
+      try {
+        this.video.playbackRate = 1.0;
+      } catch (e) {}
+    }
     
     // Completely hide #app to eliminate background paint overhead & prevent recommendations shining through
     const appEl = document.getElementById('app');
@@ -425,7 +528,10 @@ class VideoPlayer {
       this.playDirect(hlsUrl, 'Auto HLS');
     } else {
       this.app.showToast('Внимание: Видео недоступно или заблокировано правообладателем');
-      setTimeout(() => this.close(), 2500);
+      const errSession = this.playbackSessionId;
+      this.pendingCloseTimer = setTimeout(() => {
+        if (errSession === this.playbackSessionId) this.close();
+      }, 2500);
     }
   }
 
@@ -760,6 +866,7 @@ class VideoPlayer {
       this.video.pause();
       this.isPlaying = false;
       this.updatePlayBtn();
+      this._flushWatchProgress();
       this.wakeOSD(4500); // Display controls cleanly for 4.5s on pause, then auto-fade
       if (this.app.nav && this.playBtn) {
         this.app.nav.setFocus(this.playBtn);
@@ -768,10 +875,22 @@ class VideoPlayer {
     }
   }
 
+  _flushWatchProgress() {
+    if (!this.currentVideo || !this.video || (this.currentVideo && this.currentVideo.isLive)) return;
+    if (this.pendingResumeTime > 0) return;
+    const cur = this.video.currentTime || 0;
+    const dur = this.getDuration();
+    if (cur > 5 && dur > 10 && this.app && typeof this.app.saveWatchProgress === 'function') {
+      this.app.saveWatchProgress(this.currentVideo.id, cur, dur);
+      this._lastProgressSaveMs = Date.now();
+    }
+  }
+
   wakeOSD(duration = 4500) {
     this.osd.classList.remove('hidden');
-    this.osd.classList.remove('seeking');
-    this.isSeeking = false;
+    if (!this.isSeeking && !this.seekCommitTimer) {
+      this.osd.classList.remove('seeking');
+    }
     clearTimeout(this.osdTimeout);
     if (duration > 0) {
       this.osdTimeout = setTimeout(() => {
@@ -782,6 +901,10 @@ class VideoPlayer {
 
   hideOSD() {
     clearTimeout(this.osdTimeout);
+    clearTimeout(this.seekCommitTimer);
+    this.seekCommitTimer = null;
+    clearTimeout(this.seekSafetyTimer);
+    this.seekSafetyTimer = null;
     this.osd.classList.add('hidden');
     this.osd.classList.remove('seeking');
     this.isSeeking = false;
@@ -901,9 +1024,13 @@ class VideoPlayer {
       }
     }
 
-    // Periodically save watch progress for resume
+    // Periodically save watch progress for resume (throttled to every 5s to avoid main-thread JSON/storage stutters)
     if (this.currentVideo && cur > 5 && dur > 10) {
-      this.app.saveWatchProgress(this.currentVideo.id, cur, dur);
+      const nowMs = Date.now();
+      if (!this._lastProgressSaveMs || (nowMs - this._lastProgressSaveMs >= 5000)) {
+        this._lastProgressSaveMs = nowMs;
+        this.app.saveWatchProgress(this.currentVideo.id, cur, dur);
+      }
     }
   }
 
@@ -913,6 +1040,7 @@ class VideoPlayer {
 
   onEnded() {
     this.clearStallWatchdog();
+    this._flushWatchProgress();
     this.isPlaying = false;
     this.updatePlayBtn();
     this.wakeOSD();
@@ -964,7 +1092,11 @@ class VideoPlayer {
 
   close() {
     this.playbackSessionId++;
+    this._flushWatchProgress();
+    const closedVideoId = this.currentVideo ? this.currentVideo.id : null;
     this.stopPowerKeepAlive();
+    clearTimeout(this.pendingCloseTimer);
+    this.pendingCloseTimer = null;
     clearTimeout(this.osdTimeout);
     clearTimeout(this.seekCommitTimer);
     clearTimeout(this.seekSafetyTimer);
@@ -973,8 +1105,14 @@ class VideoPlayer {
     this.isSeeking = false;
     this.pendingResumeTime = 0;
     this.stallRecoveryAttempts = 0;
+    this.showBuffering(false);
+    if (this.osd) this.osd.classList.remove('seeking');
+    if (this.seekBubble) this.seekBubble.style.display = 'none';
     this.cleanupEngines();
     this.video.pause();
+    try {
+      this.video.playbackRate = 1.0;
+    } catch (e) {}
     this.video.removeAttribute('src');
     this.video.load();
     this.container.style.display = 'none';
@@ -985,7 +1123,19 @@ class VideoPlayer {
 
     this.isPlaying = false;
     this.currentVideo = null;
-    this.app.focusCurrentSection();
+
+    if (closedVideoId && this.app && typeof this.app.refreshCardProgress === 'function') {
+      this.app.refreshCardProgress(closedVideoId);
+    }
+
+    const mainEl = document.getElementById('main-content');
+    const returnEl = this.lastReturnFocusEl;
+    this.lastReturnFocusEl = null;
+    if (returnEl && mainEl && mainEl.contains(returnEl) && this.app.nav) {
+      this.app.nav.setFocus(returnEl);
+    } else {
+      this.app.focusCurrentSection();
+    }
   }
 }
 
