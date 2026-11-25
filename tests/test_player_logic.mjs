@@ -57,6 +57,7 @@ elements.set('progress-buffered', new MockElement('div', 'progress-buffered'));
 elements.set('progress-thumb', new MockElement('div', 'progress-thumb'));
 elements.set('time-current', new MockElement('div', 'time-current'));
 elements.set('time-total', new MockElement('div', 'time-total'));
+elements.set('time-remaining', new MockElement('span', 'time-remaining'));
 elements.set('play-btn-icon', new MockElement('div', 'play-btn-icon'));
 elements.set('seek-bubble', new MockElement('div', 'seek-bubble'));
 elements.set('seek-bubble-text', new MockElement('span', 'seek-bubble-text'));
@@ -196,5 +197,147 @@ test('VideoPlayer - Live Stream Mode disables seek and shows LIVE badge', async 
   player.video.currentTime = 50;
   player.seekProgressive(10);
   assert.equal(player.isSeeking, false, 'Seek must be blocked on Live streams');
+  player.close();
+});
+
+test('VideoPlayer - HLS Resume configures native startPosition and preserves progress before seek lands', async () => {
+  const app = new MockApp();
+  app.saveWatchProgress('-500_500', 620, 1200);
+
+  const player = new VideoPlayer(app);
+  player.loadAndPlay({
+    id: '-500_500',
+    title: 'Длинное видео',
+    streams: { hls: 'https://cdn.vk.com/long.m3u8' }
+  });
+
+  // Verify Hls config received startPosition and non-zero backBufferLength
+  assert.equal(player.hls.cfg.startPosition, 620, 'HLS startPosition must match saved position');
+  assert.ok(player.hls.cfg.backBufferLength >= 10, 'backBufferLength must be >= 10 to prevent post-seek GOP eviction');
+
+  // Simulate early pre-seek timeupdate before seek lands (readyState 0 -> cur=4s)
+  player.video.readyState = 0;
+  player.video.currentTime = 4;
+  player.hls.trigger('manifestParsed', { levels: [{ height: 2160 }] });
+  player.onTimeUpdate();
+  assert.equal(app.getSavedPosition('-500_500'), 620, 'Saved position must NOT be overwritten by early pre-seek timeupdate');
+
+  // Simulate metadata loaded -> position applied
+  player.video.readyState = 1;
+  player.video.dispatchEvent({ type: 'loadedmetadata' });
+  assert.equal(player.video.currentTime, 620, 'loadedmetadata must apply pendingResumeTime');
+
+  player.video.readyState = 3;
+  player.video.dispatchEvent({ type: 'playing' });
+  assert.equal(player.pendingResumeTime, 0, 'pendingResumeTime clears once playing near target');
+
+  player.close();
+});
+
+test('VideoPlayer - Shaka passes startTime to load and falls back cleanly to HLS preserving resumeTime', async () => {
+  const app = new MockApp();
+  app.saveWatchProgress('-600_600', 310, 900);
+
+  let loadedUrl = null;
+  let loadedStartTime = null;
+  let shakaConfig = null;
+  const shakaHandlers = {};
+
+  class MockShakaPlayer {
+    static isBrowserSupported() { return true; }
+    constructor(video) { this.video = video; }
+    configure(cfg) { shakaConfig = Object.assign(shakaConfig || {}, cfg); }
+    getNetworkingEngine() { return { registerRequestFilter() {} }; }
+    addEventListener(evt, fn) { shakaHandlers[evt] = fn; }
+    async load(url, startTime) {
+      loadedUrl = url;
+      loadedStartTime = startTime;
+    }
+    getVariantTracks() {
+      return [{ height: 2160, width: 3840, bandwidth: 8000000, videoCodec: 'av01', active: true }];
+    }
+    selectVariantTrack() {}
+    destroy() {}
+  }
+
+  globalThis.shaka = { Player: MockShakaPlayer };
+  win.shaka = globalThis.shaka;
+
+  const player = new VideoPlayer(app);
+  player.video.readyState = 4;
+  player.video.currentTime = 310;
+
+  await player.loadAndPlay({
+    id: '-600_600',
+    title: 'AV1 Видео с продолжением',
+    streams: {
+      dash_webm_av1: 'https://cdn.vk.com/av1.mpd',
+      hls: 'https://cdn.vk.com/fallback.m3u8'
+    }
+  });
+  await new Promise(r => setTimeout(r, 20));
+
+  assert.equal(loadedUrl, 'https://cdn.vk.com/av1.mpd');
+  assert.equal(loadedStartTime, 310, 'Shaka load() must receive startTime directly');
+  assert.ok(shakaConfig.streaming.bufferBehind >= 10, 'Shaka bufferBehind must not be 0');
+
+  // Trigger async Shaka error -> should fall back to HLS at current position (310s)
+  shakaHandlers.error({ detail: { code: 3016, severity: 2 } });
+  assert.ok(player.hls, 'Should fall back to HLS on async Shaka error');
+  assert.equal(player.hls.cfg.startPosition, 310, 'Fallback HLS must preserve resume position 310s');
+
+  player.close();
+  delete globalThis.shaka;
+  delete win.shaka;
+});
+
+test('VideoPlayer - Non-fatal bufferStalledError nudges playback forward', async () => {
+  const app = new MockApp();
+  const player = new VideoPlayer(app);
+  let startLoadPos = null;
+
+  player.loadAndPlay({
+    id: '-700_700',
+    title: 'Тест залипания буфера',
+    streams: { hls: 'https://cdn.vk.com/stall.m3u8' }
+  });
+  player.hls.startLoad = (pos) => { startLoadPos = pos; };
+  player.video.paused = false;
+  player.video.currentTime = 120;
+  player.video.duration = 500;
+
+  player.hls.trigger('error', { fatal: false, type: 'mediaError', details: 'bufferStalledError' });
+  assert.ok(player.video.currentTime > 120, 'Non-fatal stall must nudge currentTime forward');
+  assert.ok(startLoadPos > 120, 'Non-fatal stall must re-kick HLS startLoad');
+
+  player.close();
+});
+
+test('VideoPlayer - Displays remaining watch time and never leaks numeric ownerId in top-left corner', async () => {
+  const app = new MockApp();
+  const player = new VideoPlayer(app);
+
+  player.loadAndPlay({
+    id: '-220754053_456248219',
+    title: 'Ужин с Роговым',
+    ownerId: -220754053,
+    streams: { hls: 'https://cdn.vk.com/test.m3u8' }
+  });
+
+  // Top-left channel element must fall back cleanly instead of showing "-220754053"
+  assert.equal(player.channelEl.textContent, 'VK Видео', 'Must not display raw numeric ownerId in top-left corner');
+
+  // Time update calculates remaining time accurately
+  player.video.duration = 1000;
+  player.video.currentTime = 400;
+  player.onTimeUpdate();
+  assert.equal(player.timeCurrentEl.textContent, '6:40');
+  assert.equal(player.timeTotalEl.textContent, '16:40');
+  assert.equal(player.timeRemainingEl.textContent, '(-10:00)');
+
+  // Seeking updates remaining time live
+  player.seekProgressive(10); // +10s -> 410s -> remaining 590s = 9:50
+  assert.equal(player.timeRemainingEl.textContent, '(-9:50)');
+
   player.close();
 });

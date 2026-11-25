@@ -288,6 +288,16 @@ class VKApi {
     const item = resp.items[0];
     const files = item.files || {};
 
+    // Resolve authentic channel/creator name from extended response (never expose numeric owner_id in UI)
+    let authorName = item.owner_name || '';
+    if (!authorName && item.owner_id < 0 && Array.isArray(resp.groups)) {
+      const grp = resp.groups.find(g => Math.abs(g.id) === Math.abs(item.owner_id));
+      if (grp && grp.name) authorName = grp.name;
+    } else if (!authorName && item.owner_id > 0 && Array.isArray(resp.profiles)) {
+      const prof = resp.profiles.find(p => p.id === item.owner_id);
+      if (prof) authorName = `${prof.first_name || ''} ${prof.last_name || ''}`.trim();
+    }
+
     // Extract all available stream qualities (prioritize AV1 / VP9 hardware DASH and HLS)
     const streamSources = {
       dash_webm_av1: files.dash_webm_av1 || null,
@@ -317,6 +327,7 @@ class VKApi {
       views: item.views || 0,
       date: item.date,
       ownerId: item.owner_id,
+      author: authorName || '',
       isLive: item.live === 2 || Boolean(item.is_live),
       maxQuality: maxQuality,
       thumbnail: this.getBestThumbnail(item),
@@ -1436,12 +1447,271 @@ class VKApi {
   }
 
   /**
+   * Format raw catalog/block video objects with resolved group/profile authors & server viewed_duration
+   */
+  formatCatalogVideos(rawVideos = [], groupsList = [], profilesList = [], minDuration = 120) {
+    if (!Array.isArray(rawVideos) || rawVideos.length === 0) return [];
+    const groupsMap = {};
+    if (Array.isArray(groupsList)) {
+      for (const g of groupsList) {
+        if (g && g.id) groupsMap[Math.abs(g.id)] = g.name || '';
+      }
+    }
+    const profilesMap = {};
+    if (Array.isArray(profilesList)) {
+      for (const p of profilesList) {
+        if (p && p.id) {
+          profilesMap[p.id] = `${p.first_name || ''} ${p.last_name || ''}`.trim();
+        }
+      }
+    }
+
+    const out = [];
+    const seen = new Set();
+    for (const v of rawVideos) {
+      if (!v || !v.id || v.owner_id === undefined) continue;
+      if (!this.isFullLengthVideo(v, minDuration)) continue;
+      const formatted = this.formatVideoItem(v);
+      if (seen.has(formatted.id)) continue;
+      seen.add(formatted.id);
+
+      const resolvedAuthor = v.owner_id < 0
+        ? groupsMap[Math.abs(v.owner_id)]
+        : profilesMap[v.owner_id];
+      if (resolvedAuthor) formatted.author = resolvedAuthor;
+
+      formatted.rawDuration = Number(v.duration) || 0;
+      formatted.viewedDuration = Number(v.viewed_duration) || 0;
+      out.push(formatted);
+    }
+    return out;
+  }
+
+  /**
+   * Fetch cross-device server Watch History ("Продолжить просмотр") + server Personal Feed ("Все")
+   * from official VK Video Smart TV catalog endpoints (catalog.getVideoSmartTV -> catalog.getSectionBlocksLinks -> catalog.getBlockItems).
+   */
+  async getSmartTVServerContext(forceRefresh = false, historyLimit = 40) {
+    const empty = { watchHistory: [], personalFeedVideos: [], serverProgress: {} };
+    if (!this.isAuthorized()) return empty;
+
+    const nowMs = Date.now();
+    if (
+      !forceRefresh &&
+      this._smartTvContextCache &&
+      this._smartTvContextToken === this.userToken &&
+      (nowMs - (this._smartTvContextCacheTime || 0) < 45000)
+    ) {
+      return this._smartTvContextCache;
+    }
+
+    try {
+      const smartResp = await this.callMethod('catalog.getVideoSmartTV', {
+        need_stub_blocks: 1,
+        ref: 'main'
+      }).catch(() => null);
+
+      const sections = (smartResp && smartResp.catalog && Array.isArray(smartResp.catalog.sections))
+        ? smartResp.catalog.sections
+        : [];
+      if (sections.length === 0) return empty;
+
+      const mainSec = sections.find(s => s && (s.url === 'https://vkvideo.ru' || s.title === 'Главная')) || sections[1] || sections[0];
+      if (!mainSec || !mainSec.id) return empty;
+
+      const linksResp = await this.callMethod('catalog.getSectionBlocksLinks', {
+        section_id: mainSec.id,
+        need_first_block_data: 1,
+        count: 20
+      }).catch(() => null);
+
+      if (!linksResp) return empty;
+
+      // 1. Personal server feed ("Все" first block)
+      let personalFeedVideos = [];
+      const fbd = linksResp.first_block_data;
+      if (fbd && Array.isArray(fbd.videos)) {
+        personalFeedVideos = this.formatCatalogVideos(fbd.videos, fbd.groups || [], fbd.profiles || [], 180)
+          .map(v => ({ ...v, isRecommended: true }));
+      }
+
+      // 2. Server-side Watch History ("Продолжить просмотр" block)
+      const blocks = Array.isArray(linksResp.blocks) ? linksResp.blocks : [];
+      const cwBlock = blocks.find(b => b && typeof b.title === 'string' && b.title.toLowerCase().includes('продолжить')) || blocks[1];
+
+      let watchHistory = [];
+      const serverProgress = {};
+
+      if (cwBlock && cwBlock.block_id) {
+        const cwResp = await this.callMethod('catalog.getBlockItems', {
+          block_id: cwBlock.block_id
+        }).catch(() => null);
+
+        if (cwResp && Array.isArray(cwResp.videos)) {
+          watchHistory.push(...this.formatCatalogVideos(cwResp.videos, cwResp.groups || [], cwResp.profiles || [], 120));
+
+          const nextFrom = cwResp.block && cwResp.block.next_from;
+          if (historyLimit > 20 && nextFrom) {
+            const cwResp2 = await this.callMethod('catalog.getBlockItems', {
+              block_id: cwBlock.block_id,
+              start_from: nextFrom
+            }).catch(() => null);
+            if (cwResp2 && Array.isArray(cwResp2.videos)) {
+              const seenIds = new Set(watchHistory.map(v => v.id));
+              for (const item of this.formatCatalogVideos(cwResp2.videos, cwResp2.groups || [], cwResp2.profiles || [], 120)) {
+                if (!seenIds.has(item.id)) {
+                  seenIds.add(item.id);
+                  watchHistory.push(item);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      for (const v of watchHistory) {
+        if (v.viewedDuration > 15 && v.rawDuration > 30 && v.viewedDuration < v.rawDuration - 12) {
+          const pct = Math.min(100, Math.round((v.viewedDuration / v.rawDuration) * 100));
+          if (pct <= 92) {
+            serverProgress[v.id] = {
+              currentTime: Math.floor(v.viewedDuration),
+              duration: Math.floor(v.rawDuration),
+              percent: pct,
+              timestamp: nowMs,
+              fromServer: true
+            };
+            v.progressPercent = pct;
+          }
+        }
+      }
+
+      const ctx = {
+        watchHistory: watchHistory.slice(0, historyLimit),
+        personalFeedVideos,
+        serverProgress
+      };
+      this._smartTvContextCache = ctx;
+      this._smartTvContextToken = this.userToken;
+      this._smartTvContextCacheTime = nowMs;
+      return ctx;
+    } catch (e) {
+      console.warn('[VKApi] getSmartTVServerContext error:', e);
+      return empty;
+    }
+  }
+
+  /**
+   * Fetch user's cross-device VK Video watch history from server
+   */
+  async getServerWatchHistory(limit = 40) {
+    const ctx = await this.getSmartTVServerContext(false, limit);
+    return (ctx && Array.isArray(ctx.watchHistory)) ? ctx.watchHistory : [];
+  }
+
+  /**
+   * Fetch VK's native "Similar / Discover" recommendations for recent watched videos
+   * using video.getVideoDiscover.
+   */
+  async getVideoDiscoverRecommendations(seedVideos = [], excludedIds = new Set(), perSeedCount = 8) {
+    if (!Array.isArray(seedVideos) || seedVideos.length === 0) return [];
+    const seeds = seedVideos.filter(v => v && v.id && v.id.includes('_')).slice(0, 5);
+    if (seeds.length === 0) return [];
+
+    try {
+      const results = await Promise.all(seeds.map(seed => {
+        const parts = String(seed.id).split('_');
+        const ownerId = parseInt(parts[0], 10);
+        const videoId = parseInt(parts[1], 10);
+        if (!ownerId || !videoId || isNaN(ownerId) || isNaN(videoId)) return Promise.resolve([]);
+
+        return this.callMethod('video.getVideoDiscover', {
+          owner_id: ownerId,
+          video_id: videoId,
+          ref: 'main',
+          count: perSeedCount,
+          extended: 1
+        }).then(resp => {
+          if (!resp || !Array.isArray(resp.items)) return [];
+          return this.formatCatalogVideos(resp.items, resp.groups || [], resp.profiles || [], 240)
+            .filter(v => !excludedIds.has(v.id))
+            .map(v => ({ ...v, isRecommended: true, isDiscover: true }));
+        }).catch(() => []);
+      }));
+
+      const seen = new Set();
+      const merged = [];
+      const maxLen = Math.max(...results.map(r => r.length), 0);
+      for (let i = 0; i < maxLen; i++) {
+        for (const list of results) {
+          if (list[i] && !seen.has(list[i].id)) {
+            seen.add(list[i].id);
+            merged.push(list[i]);
+          }
+        }
+      }
+      return merged;
+    } catch (e) {
+      console.warn('[VKApi] getVideoDiscoverRecommendations error:', e);
+      return [];
+    }
+  }
+
+  /**
+   * Normalize video title for cross-source deduplication (catches reposts/duplicates with vs without recommendation badges)
+   */
+  normalizeVideoTitleKey(title) {
+    if (!title || typeof title !== 'string') return '';
+    return title
+      .toLowerCase()
+      .replace(/[^a-zа-яё0-9]+/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  /**
+   * Deduplicate a video array by exact ID and normalized title (for titles >= 12 chars)
+   */
+  deduplicateVideos(videos = [], seenIds = null, seenTitles = null) {
+    const ids = seenIds || new Set();
+    const titles = seenTitles || new Set();
+    const result = [];
+    for (const v of videos) {
+      if (!v || !v.id) continue;
+      if (ids.has(v.id)) continue;
+      const tKey = this.normalizeVideoTitleKey(v.title);
+      if (tKey.length >= 12 && titles.has(tKey)) continue;
+      ids.add(v.id);
+      if (tKey.length >= 12) titles.add(tKey);
+      result.push(v);
+    }
+    return result;
+  }
+
+  /**
+   * Merge local watch history with server cross-device watch history (preserving local order first)
+   */
+  mergeHistories(localHistory = [], serverHistory = []) {
+    const merged = [];
+    const seen = new Set();
+    for (const list of [localHistory, serverHistory]) {
+      if (!Array.isArray(list)) continue;
+      for (const item of list) {
+        if (item && item.id && !seen.has(item.id)) {
+          seen.add(item.id);
+          merged.push(item);
+        }
+      }
+    }
+    return merged;
+  }
+
+  /**
    * Smart Contextual & Affinity Recommendations:
    * 1. Analyzes user watch history, subscriptions, fave creators & server newsfeed to compute genre affinity.
-   * 2. Extracts dynamic semantic search seeds from recently watched titles to find fresh episodes/related content.
-   * 3. Fetches candidate videos from premier channels (Ida Galich, Shastun, Vpiska, Azamat, Natalnaya Karta, Minaev) and lookalikes.
-   * 4. Excludes videos already watched (history or progress > 40%) and applies hybrid affinity scoring.
-   * 5. Uses smooth freshness decay instead of hard date sort to protect relevance and creator quality.
+   * 2. Fetches VK native similarity matches via video.getVideoDiscover for recent watched videos.
+   * 3. Extracts dynamic semantic search seeds from recently watched titles to find fresh episodes/related content.
+   * 4. Fetches candidate videos from premier channels and lookalikes.
+   * 5. Excludes videos already watched and applies hybrid affinity scoring.
    */
   async getSmartRecommendations(userGroupIds, localHistory = [], watchProgress = {}, userChannels = [], targetCount = 72, serverFeedVideos = [], favePages = []) {
     try {
@@ -1461,7 +1731,9 @@ class VKApi {
       // 2. Extract seeds from history items
       const seeds = this.extractRecommendationSeeds(localHistory);
 
-      // 3. Parallel fetch: Premier creator channels (Priority #1) + Semantic searches on user seeds
+      // 3. Parallel fetch: Native VK Video Discover + Premier creator channels + Semantic searches on user seeds
+      const discoverPromise = this.getVideoDiscoverRecommendations(localHistory, excludedIds, 8).catch(() => []);
+
       // A. Top Premier Popular Channels (Ida Galich, Shastun, Vpiska, Azamat, Natalnaya Karta, Minaev Live, etc.)
       const premierChannels = this.getPremierPopularChannels();
       const targetChannels = [];
@@ -1501,7 +1773,8 @@ class VKApi {
         }).then(resp => this.parseSearchRecommendationResponse(resp, userGroupIds, excludedIds, 540)).catch(() => [])
       );
 
-      const [premierChannelResults, searchResults] = await Promise.all([
+      const [discoverVideos, premierChannelResults, searchResults] = await Promise.all([
+        discoverPromise,
         Promise.all(premierPromises),
         Promise.all(seedPromises)
       ]);
@@ -1509,6 +1782,17 @@ class VKApi {
       const seen = new Set();
       const now = Math.floor(Date.now() / 1000);
       const MAX_REC_AGE = 540 * 86400; // 1.5 years freshness
+
+      // Native VK Video Discover results (highest similarity to user's actual watch history)
+      const discoverList = [];
+      for (const v of discoverVideos) {
+        if (v && v.id && !seen.has(v.id) && !excludedIds.has(v.id)) {
+          if (!v.date || (now - Number(v.date)) <= MAX_REC_AGE) {
+            seen.add(v.id);
+            discoverList.push(v);
+          }
+        }
+      }
 
       // Balanced premier list
       const premierList = [];
@@ -1537,7 +1821,7 @@ class VKApi {
         }
       }
 
-      // Server newsfeed videos (VK's algorithmic server recommendations)
+      // Server newsfeed & SmartTV "Все" videos (VK's algorithmic server recommendations)
       const serverNewsfeedList = [];
       if (Array.isArray(serverFeedVideos)) {
         for (const sv of serverFeedVideos) {
@@ -1553,10 +1837,11 @@ class VKApi {
       const premierOwnerIds = new Set(premierChannels.map(c => c.id));
       const topKeywords = topGenres.flatMap(g => g.key === 'comedy' ? ['шоу', 'вопрос', 'галич', 'шастун', 'вписка', 'карта', 'юмор', 'чбд', 'большое'] : []);
 
-      const allCandidates = [...premierList, ...seedList, ...serverNewsfeedList];
+      const allCandidates = [...discoverList, ...serverNewsfeedList, ...seedList, ...premierList];
       const scored = allCandidates.map(v => {
         let score = 50;
         const ownerId = parseInt((v.id || '').split('_')[0], 10);
+        if (v.isDiscover) score += 45;
         if (faveOwnerIds.has(ownerId)) score += 40;
         if (userGroupIds.has(ownerId)) score += 30;
         if (premierOwnerIds.has(ownerId)) score += 35;
@@ -2061,16 +2346,27 @@ class VKApi {
           const recs = await this.getSmartRecommendations(new Set(), guestHistory, passedProgress || {}, [], 64).catch(() => []);
           const trending = await this.getTrending(count).catch(() => []);
           if (recs && recs.length > 0) {
+            const seenGuestIds = new Set();
+            const seenGuestTitles = new Set();
+            const pushUnique = (target, item) => {
+              if (!item || !item.id || seenGuestIds.has(item.id)) return false;
+              const tKey = this.normalizeVideoTitleKey(item.title);
+              if (tKey.length >= 12 && seenGuestTitles.has(tKey)) return false;
+              seenGuestIds.add(item.id);
+              if (tKey.length >= 12) seenGuestTitles.add(tKey);
+              target.push(item);
+              return true;
+            };
             const merged = [];
             let rIdx = 0;
             for (let i = 0; i < trending.length; i++) {
-              merged.push(trending[i]);
-              if (merged.length % 3 === 0 && rIdx < recs.length) {
-                merged.push(recs[rIdx++]);
+              pushUnique(merged, trending[i]);
+              if (merged.length % 3 === 0) {
+                while (rIdx < recs.length && !pushUnique(merged, recs[rIdx++])) {}
               }
             }
             while (rIdx < recs.length && merged.length < count) {
-              merged.push(recs[rIdx++]);
+              pushUnique(merged, recs[rIdx++]);
             }
             return merged.slice(0, count);
           }
@@ -2080,12 +2376,19 @@ class VKApi {
     }
 
     try {
-      // 1. Fetch user channels/groups
-      const topChannelsResp = await this.callMethod('groups.get', {
-        extended: 1,
-        count: 150,
-        fields: 'activity,members_count,verified,description'
-      });
+      // 1. Fetch user channels/groups, fave pages, and SmartTV server context (watch history + personal feed) in parallel
+      const [topChannelsResp, faveResp, serverCtx] = await Promise.all([
+        this.callMethod('groups.get', {
+          extended: 1,
+          count: 150,
+          fields: 'activity,members_count,verified,description'
+        }),
+        this.callMethod('fave.getPages', {
+          type: 'groups',
+          count: 50
+        }).catch(() => ({ items: [] })),
+        this.getSmartTVServerContext(false, 40).catch(() => ({ watchHistory: [], personalFeedVideos: [], serverProgress: {} }))
+      ]);
 
       const stopWords = [
         'администрация', 'муниципал', 'оханск', 'мбоу', 'сош', 'дума',
@@ -2112,6 +2415,7 @@ class VKApi {
       const allChannels = (topChannelsResp && topChannelsResp.items) ? topChannelsResp.items : [];
       const entertainmentChannels = allChannels.filter(isEntertainmentChannel);
       const userGroupIds = new Set(allChannels.map(g => -Math.abs(g.id)));
+      const favePages = (faveResp && faveResp.items) ? faveResp.items : [];
 
       // Check user-scoped watch history and progress to boost channels user actually watches
       let localHistory = [];
@@ -2140,8 +2444,13 @@ class VKApi {
         } catch (e) {}
       }
 
+      // Merge local TV history with cross-device server history ("Продолжить просмотр")
+      const effectiveHistory = this.mergeHistories(localHistory, serverCtx.watchHistory || []);
+      this.lastServerProgress = serverCtx.serverProgress || {};
+      const effectiveProgress = { ...(serverCtx.serverProgress || {}), ...(watchProgress || {}) };
+
       const localWatchCounts = {};
-      for (const h of localHistory) {
+      for (const h of effectiveHistory) {
         if (h && h.id) {
           const ownerId = parseInt(h.id.split('_')[0], 10);
           if (ownerId) {
@@ -2150,7 +2459,7 @@ class VKApi {
         }
       }
 
-      // Rank channels: heavily boost TV-watched channels, then prioritize verified creators and member volume
+      // Rank channels: heavily boost TV & cross-device watched channels, then prioritize verified creators and member volume
       const rankedChannels = [...entertainmentChannels].sort((a, b) => {
         const watchA = (localWatchCounts[-a.id] || 0) * 100;
         const watchB = (localWatchCounts[-b.id] || 0) * 100;
@@ -2166,13 +2475,15 @@ class VKApi {
         this.getChannelVideos(-ch.id, 10, ch.name, 240).catch(() => [])
       );
 
-      // Smart contextual & affinity recommendations (4x pool: up to 72 videos)
+      // Smart contextual & affinity recommendations (server history + video.getVideoDiscover + personal feed + keyword seeds)
       const recPromise = this.getSmartRecommendations(
         userGroupIds,
-        localHistory,
-        watchProgress,
+        effectiveHistory,
+        effectiveProgress,
         rankedChannels,
-        72
+        72,
+        serverCtx.personalFeedVideos || [],
+        favePages
       ).catch(() => []);
 
       const [channelVideosResults, similarVideos] = await Promise.all([
@@ -2182,15 +2493,19 @@ class VKApi {
 
       // Combine with diversity limit: max 6 videos per channel (keyed by owner ID)
       const seen = new Set();
+      const seenTitles = new Set();
       const channelCounts = {};
       const topChannelVideos = [];
 
       const addVideoIfEligible = (v) => {
         if (!v || !v.id) return false;
         if (seen.has(v.id)) return false;
+        const tKey = this.normalizeVideoTitleKey(v.title);
+        if (tKey.length >= 12 && seenTitles.has(tKey)) return false;
         const ownerId = v.id.split('_')[0];
         if ((channelCounts[ownerId] || 0) >= 6) return false;
         seen.add(v.id);
+        if (tKey.length >= 12) seenTitles.add(tKey);
         channelCounts[ownerId] = (channelCounts[ownerId] || 0) + 1;
         topChannelVideos.push(v);
         return true;
@@ -2212,19 +2527,43 @@ class VKApi {
       const freshChannelVideos = topChannelVideos.filter(v => !v.date || (now - Number(v.date)) <= MAX_FEED_AGE);
       const effectiveChannelVideos = freshChannelVideos.length >= 24 ? freshChannelVideos : topChannelVideos;
 
-      // 3. Interleave smart recommendations evenly across the feed
+      // Rebuild seen sets strictly from what survived into effectiveChannelVideos before blending recommendations
+      const finalSeenIds = new Set();
+      const finalSeenTitles = new Set();
+      const markFinalSeen = (v) => {
+        if (!v || !v.id) return false;
+        if (finalSeenIds.has(v.id)) return false;
+        const tKey = this.normalizeVideoTitleKey(v.title);
+        if (tKey.length >= 12 && finalSeenTitles.has(tKey)) return false;
+        finalSeenIds.add(v.id);
+        if (tKey.length >= 12) finalSeenTitles.add(tKey);
+        return true;
+      };
+
+      // 3. Interleave smart recommendations evenly across the feed (strictly deduplicated by ID and title!)
       const finalVideos = [];
       let simIdx = 0;
       for (let i = 0; i < effectiveChannelVideos.length; i++) {
-        finalVideos.push(effectiveChannelVideos[i]);
-        if (finalVideos.length % 3 === 0 && simIdx < similarVideos.length) {
-          finalVideos.push(similarVideos[simIdx++]);
+        if (markFinalSeen(effectiveChannelVideos[i])) {
+          finalVideos.push(effectiveChannelVideos[i]);
+        }
+        if (finalVideos.length % 3 === 0) {
+          while (simIdx < similarVideos.length) {
+            const candidate = similarVideos[simIdx++];
+            if (markFinalSeen(candidate)) {
+              finalVideos.push(candidate);
+              break;
+            }
+          }
         }
       }
 
-      // If any similar videos remaining, append at end
+      // If any similar videos remaining, append remaining unique ones at end
       while (simIdx < similarVideos.length && finalVideos.length < count) {
-        finalVideos.push(similarVideos[simIdx++]);
+        const candidate = similarVideos[simIdx++];
+        if (markFinalSeen(candidate)) {
+          finalVideos.push(candidate);
+        }
       }
 
       // 5. Chronological sorting for flat feed
@@ -2315,12 +2654,16 @@ class VKApi {
         watchProgress = passedProgress;
       }
 
-      const topChannelsResp = await this.callMethod('groups.get', {
-        extended: 1,
-        count: 150,
-        fields: 'activity,members_count,verified,description'
-      }).catch(() => ({ items: [] }));
+      const [topChannelsResp, serverCtx] = await Promise.all([
+        this.callMethod('groups.get', {
+          extended: 1,
+          count: 150,
+          fields: 'activity,members_count,verified,description'
+        }).catch(() => ({ items: [] })),
+        this.getSmartTVServerContext(false, 40).catch(() => ({ watchHistory: [], personalFeedVideos: [], serverProgress: {} }))
+      ]);
 
+      const effectiveHistory = this.mergeHistories(localHistory, serverCtx.watchHistory || []);
       const allChannels = (topChannelsResp && topChannelsResp.items) ? topChannelsResp.items : [];
       const userGroupIds = new Set(allChannels.map(g => -Math.abs(g.id)));
 
@@ -2339,8 +2682,20 @@ class VKApi {
         this.getChannelVideos(-ch.id, 6, ch.name, 240, videoOffset).catch(() => [])
       );
 
+      // Rotate deeper through cross-device server history for native video.getVideoDiscover recommendations
+      const discoverExcluded = new Set(effectiveHistory.map(h => h.id));
+      let discoverPromise = Promise.resolve([]);
+      if (effectiveHistory.length > 0) {
+        const dStart = (Math.floor(offset / 36) * 3) % effectiveHistory.length;
+        const rotatedSeeds = [];
+        for (let i = 0; i < Math.min(3, effectiveHistory.length); i++) {
+          rotatedSeeds.push(effectiveHistory[(dStart + i) % effectiveHistory.length]);
+        }
+        discoverPromise = this.getVideoDiscoverRecommendations(rotatedSeeds, discoverExcluded, 6).catch(() => []);
+      }
+
       // Next tier of recommendations - circular wrap-around seeds
-      const seeds = this.extractRecommendationSeeds(localHistory);
+      const seeds = this.extractRecommendationSeeds(effectiveHistory);
       const baseSeeds = seeds.length > 0 ? seeds : [
         'шоу', 'стендап', 'новости', 'обзор', 'интервью', 'гаджеты', 'кино', 'игры'
       ];
@@ -2371,51 +2726,51 @@ class VKApi {
         this.getChannelVideos(ch2.id, 4, ch2.name, 240, Math.floor(offset / 48) * 2).catch(() => [])
       ];
 
-      const [channelVideosResults, searchResults, premierResults] = await Promise.all([
+      const [channelVideosResults, discoverResults, searchResults, premierResults] = await Promise.all([
         Promise.all(channelPromises),
+        discoverPromise,
         Promise.all(recPromises),
         Promise.all(premierPromises)
       ]);
 
       const flatCh = channelVideosResults.flat().filter(Boolean);
-      const flatRecs = [...searchResults.flat().filter(Boolean), ...premierResults.flat().filter(Boolean)]
-        .map(v => ({ ...v, isRecommended: true }));
+      const flatRecs = [
+        ...(discoverResults || []),
+        ...searchResults.flat().filter(Boolean),
+        ...premierResults.flat().filter(Boolean)
+      ].map(v => ({ ...v, isRecommended: true }));
 
       const merged = [];
       const seen = new Set();
+      const seenTitles = new Set();
+      const pushUnique = (item) => {
+        if (!item || !item.id || seen.has(item.id)) return false;
+        const tKey = this.normalizeVideoTitleKey(item.title);
+        if (tKey.length >= 12 && seenTitles.has(tKey)) return false;
+        seen.add(item.id);
+        if (tKey.length >= 12) seenTitles.add(tKey);
+        merged.push(item);
+        return true;
+      };
+
       let rIdx = 0;
       for (let i = 0; i < flatCh.length; i++) {
-        const v = flatCh[i];
-        if (v && v.id && !seen.has(v.id)) {
-          seen.add(v.id);
-          merged.push(v);
-        }
-        if (merged.length % 3 === 0 && rIdx < flatRecs.length) {
-          const r = flatRecs[rIdx++];
-          if (r && r.id && !seen.has(r.id)) {
-            seen.add(r.id);
-            merged.push(r);
-          }
+        pushUnique(flatCh[i]);
+        if (merged.length % 3 === 0) {
+          while (rIdx < flatRecs.length && !pushUnique(flatRecs[rIdx++])) {}
         }
         if (merged.length >= count) break;
       }
       while (rIdx < flatRecs.length && merged.length < count) {
-        const r = flatRecs[rIdx++];
-        if (r && r.id && !seen.has(r.id)) {
-          seen.add(r.id);
-          merged.push(r);
-        }
+        pushUnique(flatRecs[rIdx++]);
       }
 
       // If channels and seeds yielded less than desired count, pull from trending buffer
       if (merged.length < count) {
         const trendingBuffer = await this.getTrending(count, offset % 100).catch(() => []);
         for (const t of trendingBuffer) {
-          if (t && t.id && !seen.has(t.id)) {
-            seen.add(t.id);
-            merged.push(t);
-            if (merged.length >= count) break;
-          }
+          pushUnique(t);
+          if (merged.length >= count) break;
         }
       }
 

@@ -878,3 +878,194 @@ test('VKApi - getHomeCatalog returns structured shelves with Hero and category r
   const subsShelf = catalog.shelves.find(s => s.id === 'subscriptions');
   assert.ok(subsShelf, 'Must contain subscriptions shelf');
 });
+
+test('VKApi - getServerWatchHistory & getVideoDiscoverRecommendations pull cross-device history and similar videos', async () => {
+  const api = new VKApi();
+  api.setToken('mock_server_history_token');
+  const now = Math.floor(Date.now() / 1000);
+
+  api.callMethod = async (method, params) => {
+    if (method === 'catalog.getVideoSmartTV') {
+      return {
+        catalog: {
+          sections: [
+            { id: 'sec_search', title: 'Введите запрос' },
+            { id: 'sec_main', title: 'Главная', url: 'https://vkvideo.ru' }
+          ]
+        }
+      };
+    }
+    if (method === 'catalog.getSectionBlocksLinks') {
+      return {
+        blocks: [
+          { block_id: 'blk_all', title: 'Все' },
+          { block_id: 'blk_cw', title: 'Продолжить просмотр' }
+        ],
+        first_block_data: {
+          videos: [
+            { id: 901, owner_id: -777, title: 'Персональное из Все', duration: 1500, width: 1920, height: 1080, date: now - 500 }
+          ],
+          groups: [{ id: 777, name: 'Шоу Канал' }]
+        }
+      };
+    }
+    if (method === 'catalog.getBlockItems' && params.block_id === 'blk_cw' && !params.start_from) {
+      return {
+        block: { next_from: 'page2_cursor' },
+        videos: [
+          { id: 101, owner_id: -158117199, title: 'Подземелья Чикен Карри #55', duration: 7200, viewed_duration: 3600, width: 1920, height: 1080, date: now - 3600 },
+          { id: 102, owner_id: -158117199, title: 'Короткий клип', duration: 40, viewed_duration: 10, width: 720, height: 1280, date: now - 3600 }
+        ],
+        groups: [{ id: 158117199, name: 'Чикен Карри' }]
+      };
+    }
+    if (method === 'catalog.getBlockItems' && params.start_from === 'page2_cursor') {
+      return {
+        videos: [
+          { id: 103, owner_id: -209976560, title: 'Сёрч | выпуск 1', duration: 2400, viewed_duration: 1200, width: 1920, height: 1080, date: now - 7200 }
+        ],
+        groups: [{ id: 209976560, name: 'LABELCOM' }]
+      };
+    }
+    if (method === 'video.getVideoDiscover') {
+      return {
+        items: [
+          { id: 201, owner_id: -212021856, title: 'Настолка | 8 выпуск | Равдин vs Щетка', duration: 3000, width: 3840, height: 2160, date: now - 1000 }
+        ],
+        groups: [{ id: 212021856, name: 'КликКлак' }]
+      };
+    }
+    return { items: [] };
+  };
+
+  const ctx = await api.getSmartTVServerContext(true, 40);
+  assert.equal(ctx.watchHistory.length, 2, 'Should include 2 full-length server watched videos across 2 pages (excluding 40s short)');
+  assert.equal(ctx.watchHistory[0].id, '-158117199_101');
+  assert.equal(ctx.watchHistory[0].author, 'Чикен Карри');
+  assert.equal(ctx.watchHistory[1].id, '-209976560_103');
+  assert.equal(ctx.serverProgress['-158117199_101'].currentTime, 3600, 'Should capture cross-device viewed_duration');
+  assert.equal(ctx.serverProgress['-158117199_101'].percent, 50);
+  assert.equal(ctx.personalFeedVideos[0].id, '-777_901');
+
+  const discoverRecs = await api.getVideoDiscoverRecommendations(ctx.watchHistory, new Set(['-158117199_101']), 8);
+  assert.ok(discoverRecs.some(v => v.id === '-212021856_201' && v.isDiscover && v.isRecommended), 'Should return similar recommendations via video.getVideoDiscover');
+});
+
+test('VKApi - getSmartFeed surfaces server watch history discover matches even when local TV history is empty', async () => {
+  const api = new VKApi();
+  api.setToken('mock_smart_discover_token');
+  const now = Math.floor(Date.now() / 1000);
+
+  api.callMethod = async (method, params) => {
+    if (method === 'groups.get') {
+      return { items: [{ id: 10, name: 'Мой Канал' }] };
+    }
+    if (method === 'video.get') {
+      return {
+        items: [{ id: 11, owner_id: -10, title: 'Свежий ролик подписки', duration: 900, width: 1920, height: 1080, date: now - 200 }]
+      };
+    }
+    if (method === 'catalog.getVideoSmartTV') {
+      return { catalog: { sections: [{ id: 's0', title: 'Поиск' }, { id: 's1', title: 'Главная', url: 'https://vkvideo.ru' }] } };
+    }
+    if (method === 'catalog.getSectionBlocksLinks') {
+      return {
+        blocks: [
+          { block_id: 'b_all', title: 'Все' },
+          { block_id: 'b_cw', title: 'Продолжить просмотр' }
+        ],
+        first_block_data: { videos: [] }
+      };
+    }
+    if (method === 'catalog.getBlockItems') {
+      return {
+        videos: [
+          { id: 55, owner_id: -158117199, title: 'Подземелья Чикен Карри #55', duration: 7200, viewed_duration: 1800, width: 1920, height: 1080, date: now - 10000 }
+        ],
+        groups: [{ id: 158117199, name: 'Чикен Карри' }]
+      };
+    }
+    if (method === 'video.getVideoDiscover') {
+      return {
+        items: [
+          { id: 888, owner_id: -228650808, title: 'СВОЯК I Похожее шоу', duration: 3600, width: 1920, height: 1080, date: now - 100 }
+        ],
+        groups: [{ id: 228650808, name: 'Площадка' }]
+      };
+    }
+    return { items: [] };
+  };
+
+  // Empty local TV history!
+  const feed = await api.getSmartFeed(30, [], {});
+  assert.ok(feed.some(v => v.id === '-228650808_888'), 'Feed must include video.getVideoDiscover recommendations seeded from server watch history');
+  assert.equal(api.lastServerProgress['-158117199_55'].currentTime, 1800, 'getSmartFeed must expose cross-device serverProgress');
+});
+
+test('VKApi - getSmartFeed eliminates duplicate videos between channel uploads and recommendations (both by ID and by normalized title)', async () => {
+  const api = new VKApi();
+  api.setToken('mock_dedup_token');
+  const now = Math.floor(Date.now() / 1000);
+
+  api.callMethod = async (method, params) => {
+    if (method === 'groups.get') {
+      return { items: [{ id: 220754053, name: 'VK Видео' }] };
+    }
+    if (method === 'video.get') {
+      return {
+        items: [
+          // Same exact ID that will also arrive in personalFeed / discover
+          { id: 456248219, owner_id: -220754053, title: 'Ужин с Роговым: Легендарные шефы', duration: 2400, width: 1920, height: 1080, date: now - 300 },
+          // Same title uploaded under different owner_id
+          { id: 101, owner_id: -220754053, title: 'КСТАТИ #121 — Владимир Шахрин!', duration: 3000, width: 1920, height: 1080, date: now - 400 }
+        ]
+      };
+    }
+    if (method === 'catalog.getVideoSmartTV') {
+      return { catalog: { sections: [{ id: 's0', title: 'Поиск' }, { id: 's1', title: 'Главная', url: 'https://vkvideo.ru' }] } };
+    }
+    if (method === 'catalog.getSectionBlocksLinks') {
+      return {
+        blocks: [
+          { block_id: 'b_all', title: 'Все' },
+          { block_id: 'b_cw', title: 'Продолжить просмотр' }
+        ],
+        first_block_data: {
+          videos: [
+            // Exact ID duplicate (would otherwise get isRecommended: true badge)
+            { id: 456248219, owner_id: -220754053, title: 'Ужин с Роговым: Легендарные шефы', duration: 2400, width: 1920, height: 1080, date: now - 300 },
+            // Different owner_id, normalized title duplicate
+            { id: 999, owner_id: -111222, title: 'КСТАТИ #121 – Владимир Шахрин', duration: 3000, width: 1920, height: 1080, date: now - 400 },
+            // Truly unique recommendation
+            { id: 777, owner_id: -555666, title: 'Уникальная рекомендация шоу', duration: 2000, width: 1920, height: 1080, date: now - 500 }
+          ]
+        }
+      };
+    }
+    if (method === 'catalog.getBlockItems') {
+      return { videos: [] };
+    }
+    return { items: [] };
+  };
+
+  const feed = await api.getSmartFeed(30, [], {});
+  const rogovMatches = feed.filter(v => v.id === '-220754053_456248219');
+  const kstatiMatches = feed.filter(v => (v.title || '').includes('КСТАТИ #121'));
+  assert.equal(rogovMatches.length, 1, 'Same video ID must appear strictly once (not duplicated with recommendation badge)');
+  assert.equal(kstatiMatches.length, 1, 'Same normalized video title across channels must appear strictly once');
+  assert.ok(feed.some(v => v.id === '-555666_777'), 'Unique recommendation must still be included');
+});
+
+test('VKApi - getVideoDetails resolves channel name from groups/profiles instead of leaving author empty', async () => {
+  const api = new VKApi();
+  api.callMethod = async () => ({
+    items: [
+      { id: 456248219, owner_id: -220754053, title: 'Тест видео', duration: 600, files: { mp4_1080: 'https://cdn.vk.com/1080.mp4' } }
+    ],
+    groups: [
+      { id: 220754053, name: 'VK Видео' }
+    ]
+  });
+  const details = await api.getVideoDetails('-220754053_456248219');
+  assert.equal(details.author, 'VK Видео');
+});

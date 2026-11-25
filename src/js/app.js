@@ -581,7 +581,13 @@ class VKVideoApp {
 
     // User-scoped storage keys for authorized vs guest feed
     const userSuffix = this.activeUserId ? `user_${this.activeUserId}` : 'guest';
-    const cacheKey = isAuth ? `vk_home_feed_cache_auth_v7_${userSuffix}` : 'vk_home_feed_cache_guest_v7';
+    const cacheKey = isAuth ? `vk_home_feed_cache_auth_v8_${userSuffix}` : 'vk_home_feed_cache_guest_v8';
+    try {
+      localStorage.removeItem(`vk_home_showcase_v1_${userSuffix}`);
+      localStorage.removeItem('vk_home_showcase_v1_guest');
+      localStorage.removeItem(`vk_home_feed_cache_auth_v7_${userSuffix}`);
+      localStorage.removeItem('vk_home_feed_cache_guest_v7');
+    } catch (e) {}
 
     // 1. Instant Cache Render (Stale-While-Revalidate: 0-15 ms)
     let cachedVideos = this.homeFeedCache;
@@ -616,6 +622,24 @@ class VKVideoApp {
         }
 
         if (freshVideos && freshVideos.length > 0) {
+          // Sync cross-device watch progress (from phone/PC/other VK Video apps) into local progress map
+          if (this.api.lastServerProgress && typeof this.api.lastServerProgress === 'object') {
+            let syncedAny = false;
+            for (const [vidId, srvProg] of Object.entries(this.api.lastServerProgress)) {
+              const localProg = this.watchProgress[vidId];
+              if (!localProg || (srvProg.currentTime > localProg.currentTime && !localProg.timestamp)) {
+                this.watchProgress[vidId] = { ...srvProg };
+                syncedAny = true;
+              } else if (localProg && !localProg.currentTime && srvProg.currentTime > 15) {
+                this.watchProgress[vidId] = { ...srvProg };
+                syncedAny = true;
+              }
+            }
+            if (syncedAny) {
+              this.saveUserScopedData('watch_progress', this.watchProgress);
+            }
+          }
+
           this.homeFeedCache = freshVideos;
           this.homeFeedCacheTime = Date.now();
           try {
@@ -1243,12 +1267,17 @@ class VKVideoApp {
     }
   }
 
-  renderHistory() {
+  async renderHistory() {
+    this.initThumbnailObserver();
     const content = document.getElementById('main-content');
+    const isAuth = this.api.isAuthorized();
     content.innerHTML = `
       <div class="section-header">
-        <div class="section-title">История просмотров</div>
-        <button class="player-btn focusable" id="clear-hist-btn" style="font-size:16px;">Очистить историю</button>
+        <div>
+          <div class="section-title">История просмотров</div>
+          ${isAuth ? '<div class="section-subtitle">Синхронизирована с вашим аккаунтом VK Видео (ТВ, телефон и ПК)</div>' : ''}
+        </div>
+        <button class="player-btn focusable" id="clear-hist-btn" style="font-size:16px;">Очистить локальную</button>
       </div>
       <div class="video-grid" id="video-grid"></div>
     `;
@@ -1259,15 +1288,50 @@ class VKVideoApp {
         this.history = [];
         this.saveUserScopedData('history', []);
         this.renderHistory();
-        this.showToast('История очищена');
+        this.showToast('Локальная история очищена');
       });
     }
 
     const grid = document.getElementById('video-grid');
-    if (this.history.length === 0) {
+    if (this.history.length > 0) {
+      this.renderVideoCards(grid, this.history);
+    } else if (!isAuth) {
       grid.innerHTML = '<div style="color:#8b949e; font-size:22px;">История пуста</div>';
     } else {
-      this.renderVideoCards(grid, this.history);
+      this.renderSkeletons(grid, 8);
+    }
+
+    if (isAuth) {
+      try {
+        const serverHistory = await this.api.getServerWatchHistory(40);
+        if (this.api.lastServerProgress || (this.api._smartTvContextCache && this.api._smartTvContextCache.serverProgress)) {
+          const srvProgMap = (this.api._smartTvContextCache && this.api._smartTvContextCache.serverProgress) || this.api.lastServerProgress || {};
+          let changed = false;
+          for (const [vidId, srvProg] of Object.entries(srvProgMap)) {
+            if (!this.watchProgress[vidId] || (!this.watchProgress[vidId].currentTime && srvProg.currentTime > 15)) {
+              this.watchProgress[vidId] = { ...srvProg };
+              changed = true;
+            }
+          }
+          if (changed) this.saveUserScopedData('watch_progress', this.watchProgress);
+        }
+
+        const merged = this.api.mergeHistories(this.history, serverHistory);
+        if (this.currentSection === 'history') {
+          grid.innerHTML = '';
+          if (merged.length === 0) {
+            grid.innerHTML = '<div style="color:#8b949e; font-size:22px;">История пуста</div>';
+          } else {
+            this.renderVideoCards(grid, merged);
+            this.focusCurrentSection();
+          }
+        }
+      } catch (e) {
+        console.warn('[App] Server history fetch warning:', e);
+        if (this.currentSection === 'history' && this.history.length === 0) {
+          grid.innerHTML = '<div style="color:#8b949e; font-size:22px;">История пуста</div>';
+        }
+      }
     }
   }
 
@@ -1398,6 +1462,7 @@ class VKVideoApp {
         this.showToast('Загрузка видеопотока 4K...');
         try {
           const details = await this.api.getVideoDetails(video.id);
+          if (!details.author && video.author) details.author = video.author;
           this.player.loadAndPlay(details);
         } catch (err) {
           console.error('[App] Play error:', err);
@@ -1413,7 +1478,18 @@ class VKVideoApp {
       container.innerHTML = '<div style="color:var(--text-muted); font-size:22px; padding:30px;">Нет доступных полноформатных видео</div>';
       return;
     }
-    list.forEach((video, idx) => {
+    const deduped = (this.api && typeof this.api.deduplicateVideos === 'function')
+      ? this.api.deduplicateVideos(list)
+      : list;
+    container._renderedIds = new Set();
+    container._renderedTitles = new Set();
+    deduped.forEach((video, idx) => {
+      if (!video || !video.id) return;
+      container._renderedIds.add(video.id);
+      if (this.api && typeof this.api.normalizeVideoTitleKey === 'function') {
+        const tKey = this.api.normalizeVideoTitleKey(video.title);
+        if (tKey.length >= 12) container._renderedTitles.add(tKey);
+      }
       const card = this.createVideoCard(video, idx < 16);
       if (card) container.appendChild(card);
     });
@@ -1421,10 +1497,27 @@ class VKVideoApp {
 
   appendVideoCards(container, list) {
     if (!list || list.length === 0 || !container) return;
+    if (!container._renderedIds) {
+      container._renderedIds = new Set();
+      container.querySelectorAll('.video-card[data-id]').forEach(el => {
+        if (el.dataset && el.dataset.id) container._renderedIds.add(el.dataset.id);
+      });
+    }
+    if (!container._renderedTitles) {
+      container._renderedTitles = new Set();
+    }
+
     const fragment = document.createDocumentFragment();
     list.forEach(video => {
       if (!video || !video.id) return;
-      if (this.videoMap[video.id]) return; // Strictly eliminate duplicates
+      if (container._renderedIds.has(video.id)) return; // Strictly eliminate ID duplicates
+      const tKey = (this.api && typeof this.api.normalizeVideoTitleKey === 'function')
+        ? this.api.normalizeVideoTitleKey(video.title)
+        : '';
+      if (tKey.length >= 12 && container._renderedTitles.has(tKey)) return; // Eliminate cross-channel repost duplicates
+
+      container._renderedIds.add(video.id);
+      if (tKey.length >= 12) container._renderedTitles.add(tKey);
       const card = this.createVideoCard(video, false);
       if (card) fragment.appendChild(card);
     });
@@ -1661,6 +1754,7 @@ class VKVideoApp {
       this.showToast('Загрузка видеопотока 4K...');
       try {
         const details = await this.api.getVideoDetails(video.id);
+        if (!details.author && video.author) details.author = video.author;
         this.player.loadAndPlay(details);
       } catch (err) {
         this.showToast(`Ошибка: ${err.message}`);

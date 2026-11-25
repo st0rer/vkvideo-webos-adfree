@@ -6,7 +6,7 @@ import os
 TV_IP = "192.168.1.199"
 TELNET_PORT = 23
 DATA_PORT = 9999
-IPK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build", "org.webosbrew.vkvideo.adfree_1.0.0_all.ipk")
+IPK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "org.webosbrew.vkvideo.adfree_1.0.0_all.ipk")
 
 data = open(IPK_PATH, "rb").read()
 file_size = len(data)
@@ -77,7 +77,8 @@ time.sleep(2.0)
 # 4. Check received file size
 exec_telnet("ls -la /tmp/vkvideo.ipk", wait=1.0)
 
-# 5. Remove any old installation
+# 5. Close running instance & remove old installation
+exec_telnet("luna-send -n 1 -f luna://com.webos.applicationManager/closeByAppId '{\"id\":\"org.webosbrew.vkvideo.adfree\"}'", wait=1.5)
 exec_telnet("luna-send -n 1 -f luna://com.webos.appInstallService/dev/remove '{\"id\":\"org.webosbrew.vkvideo.adfree\"}'", wait=2.0)
 
 # 6. Install package
@@ -92,6 +93,10 @@ exec_telnet("luna-send -n 1 -f luna://com.webos.applicationManager/getAppInfo '{
 
 # 9. Clean up
 exec_telnet("rm -f /tmp/recv.py /tmp/vkvideo.ipk", wait=1.0)
+
+# 10. Launch app
+print("\nLaunching VK Video AdFree 4K on TV...")
+exec_telnet("luna-send -n 1 -f luna://com.webos.applicationManager/launch '{\"id\":\"org.webosbrew.vkvideo.adfree\"}'", wait=2.0)
 
 tn.close()
 print("\n[SUCCESS] VK Video AdFree 4K is now installed on your LG C1 TV!")

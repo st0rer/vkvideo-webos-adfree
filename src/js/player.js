@@ -31,6 +31,13 @@ class VideoPlayer {
     this.statsInterval = null;
     this.keepAliveInterval = null;
     this.dropToastShown = false;
+    this.playbackSessionId = 0;
+    this.pendingResumeTime = 0;
+    this.networkRetryCount = 0;
+    this.stallWatchdogTimer = null;
+    this.stallRecoveryAttempts = 0;
+    this.lastProgressTime = 0;
+    this.lastStallNudgeAt = 0;
 
     // Elements
     this.titleEl = document.getElementById('osd-video-title');
@@ -42,6 +49,7 @@ class VideoPlayer {
     this.thumb = document.getElementById('progress-thumb');
     this.timeCurrentEl = document.getElementById('time-current');
     this.timeTotalEl = document.getElementById('time-total');
+    this.timeRemainingEl = document.getElementById('time-remaining');
     this.playBtnIcon = document.getElementById('play-btn-icon');
     this.playBtn = document.getElementById('btn-play-pause');
     this.playBtnText = document.getElementById('play-btn-text');
@@ -115,10 +123,12 @@ class VideoPlayer {
     const targetPct = dur > 0 ? (this.seekTargetTime / dur) * 100 : 0;
 
     // 1. Visually update seekbar & progress thumb in real time so user clearly sees where they are scrubbing
+    const remainingSec = Math.max(0, dur - this.seekTargetTime);
     if (this.progressBar) this.progressBar.style.width = `${targetPct}%`;
     if (this.thumb) this.thumb.style.left = `${targetPct}%`;
     if (this.timeCurrentEl) this.timeCurrentEl.textContent = this.formatTime(this.seekTargetTime);
     if (this.timeTotalEl) this.timeTotalEl.textContent = this.formatTime(dur);
+    if (this.timeRemainingEl) this.timeRemainingEl.textContent = dur > 1 ? `(-${this.formatTime(remainingSec)})` : '';
 
     // 2. Visually reveal seekbar HUD when full OSD is hidden
     if (this.osd && this.osd.classList.contains('hidden')) {
@@ -171,13 +181,160 @@ class VideoPlayer {
     this.seekAccelerated(step > 0 ? 1 : -1);
   }
 
+  getValidResumeTime(videoId, isLive = false) {
+    if (!videoId || isLive || !this.app || typeof this.app.getSavedPosition !== 'function') return 0;
+    const saved = Number(this.app.getSavedPosition(videoId)) || 0;
+    if (saved <= 15) return 0;
+    const dur = this.getDuration();
+    if (dur > 0 && saved >= dur - 12) return 0;
+    return Math.floor(saved);
+  }
+
+  applyResumePosition(targetTime) {
+    if (!targetTime || targetTime <= 0 || !this.video) return;
+    this.pendingResumeTime = targetTime;
+    // In Chromium/webOS MSE, setting currentTime when readyState === 0 can stall or be ignored.
+    // Apply immediately when metadata exists (readyState >= 1) or in unit-test mocks (readyState === undefined).
+    if (this.video.readyState === undefined || this.video.readyState >= 1) {
+      try {
+        const dur = this.getDuration();
+        if (dur > 0 && targetTime >= dur - 10) {
+          this.pendingResumeTime = 0;
+          return;
+        }
+        this.video.currentTime = targetTime;
+      } catch (e) {
+        console.warn('[Player] Resume currentTime error:', e);
+      }
+    }
+  }
+
+  clearStallWatchdog() {
+    if (this.stallWatchdogTimer) {
+      clearTimeout(this.stallWatchdogTimer);
+      this.stallWatchdogTimer = null;
+    }
+  }
+
+  scheduleStallWatchdog() {
+    this.clearStallWatchdog();
+    if (!this.video || this.video.paused || !this.currentVideo || this.currentVideo.isLive) return;
+    const sessionId = this.playbackSessionId;
+    this.stallWatchdogTimer = setTimeout(() => {
+      if (sessionId !== this.playbackSessionId || !this.video || this.video.paused || !this.currentVideo) return;
+      this.stallRecoveryAttempts = (this.stallRecoveryAttempts || 0) + 1;
+      const resumeAt = Math.floor(this.video.currentTime || this.pendingResumeTime || 0);
+      console.warn(`[Player] Stall watchdog triggered (attempt ${this.stallRecoveryAttempts}) at ${resumeAt}s`);
+
+      // If Shaka DASH (AV1/VP9) stalled after seek/resume, fall back cleanly to HLS at the same timestamp
+      if (this.shakaPlayer && this.currentVideo.streams && this.currentVideo.streams.hls && window.Hls && Hls.isSupported()) {
+        this.app.showToast('Переключение на стабильный HLS поток...');
+        this.playHls(this.currentVideo.streams.hls, this.currentVideo.isLive, resumeAt);
+        return;
+      }
+
+      if (this.hls) {
+        if (this.stallRecoveryAttempts <= 2) {
+          const targetPos = resumeAt > 0 ? resumeAt + 0.25 : 0;
+          try {
+            if (targetPos > 0) this.video.currentTime = targetPos;
+            this.hls.startLoad(targetPos > 0 ? targetPos : -1);
+          } catch (e) {}
+          this.scheduleStallWatchdog();
+        } else {
+          this.recoverExpiredStream(resumeAt);
+        }
+        return;
+      }
+
+      // Direct MP4 fallback recovery
+      if (this.stallRecoveryAttempts <= 2) {
+        this.recoverExpiredStream(resumeAt);
+      }
+    }, 7000);
+  }
+
+  async recoverExpiredStream(resumeAt = 0) {
+    if (!this.currentVideo || !this.app || !this.app.api || typeof this.app.api.getVideoDetails !== 'function') return;
+    const sessionId = this.playbackSessionId;
+    const targetTime = resumeAt > 0 ? resumeAt : Math.floor(this.video.currentTime || this.pendingResumeTime || 0);
+    try {
+      this.app.showToast('Обновление видеопотока...');
+      const freshDetails = await this.app.api.getVideoDetails(this.currentVideo.id);
+      if (sessionId !== this.playbackSessionId || !this.currentVideo) return;
+      this.currentVideo = freshDetails;
+      const streams = freshDetails.streams || {};
+      if (streams.hls && window.Hls && Hls.isSupported()) {
+        this.playHls(streams.hls, freshDetails.isLive, targetTime);
+      } else {
+        const direct = streams.mp4_2160 || streams.mp4_1440 || streams.mp4_1080 || streams.mp4_720 || streams.mp4_480 || streams.mp4_360;
+        if (direct) {
+          this.playDirect(direct, freshDetails.maxQuality || 'Auto', targetTime);
+        }
+      }
+    } catch (e) {
+      console.warn('[Player] Stream refresh failed:', e);
+    }
+  }
+
   bindEvents() {
-    this.video.addEventListener('waiting', () => this.showBuffering(true));
-    this.video.addEventListener('playing', () => this.showBuffering(false));
-    this.video.addEventListener('canplay', () => this.showBuffering(false));
+    this.video.addEventListener('waiting', () => {
+      this.showBuffering(true);
+      this.scheduleStallWatchdog();
+    });
+    this.video.addEventListener('stalled', () => {
+      this.scheduleStallWatchdog();
+    });
+    this.video.addEventListener('loadedmetadata', () => {
+      if (this.pendingResumeTime > 0) {
+        const dur = this.getDuration();
+        if (dur > 0 && this.pendingResumeTime >= dur - 10) {
+          this.pendingResumeTime = 0;
+          return;
+        }
+        if (Math.abs((this.video.currentTime || 0) - this.pendingResumeTime) > 3) {
+          try {
+            this.video.currentTime = this.pendingResumeTime;
+          } catch (e) {}
+        }
+      }
+    });
+    this.video.addEventListener('playing', () => {
+      this.showBuffering(false);
+      this.clearStallWatchdog();
+      this.stallRecoveryAttempts = 0;
+      if (this.pendingResumeTime > 0 && Math.abs((this.video.currentTime || 0) - this.pendingResumeTime) <= 10) {
+        this.pendingResumeTime = 0;
+      }
+    });
+    this.video.addEventListener('canplay', () => {
+      this.showBuffering(false);
+      this.clearStallWatchdog();
+      if (this.pendingResumeTime > 0) {
+        const cur = this.video.currentTime || 0;
+        if (Math.abs(cur - this.pendingResumeTime) > 4) {
+          try {
+            this.video.currentTime = this.pendingResumeTime;
+            if (this.hls) this.hls.startLoad(this.pendingResumeTime);
+          } catch (e) {}
+        } else {
+          this.pendingResumeTime = 0;
+        }
+      }
+    });
+    this.video.addEventListener('pause', () => {
+      this.clearStallWatchdog();
+    });
     this.video.addEventListener('seeked', () => {
       if (!this.seekCommitTimer) {
         this.isSeeking = false;
+      }
+      if (this.video && this.video.readyState >= 3) {
+        this.showBuffering(false);
+        this.clearStallWatchdog();
+      }
+      if (this.pendingResumeTime > 0 && Math.abs((this.video.currentTime || 0) - this.pendingResumeTime) <= 10) {
+        this.pendingResumeTime = 0;
       }
     });
     
@@ -193,6 +350,19 @@ class VideoPlayer {
    * Play Video Object
    */
   async loadAndPlay(videoData) {
+    this.playbackSessionId++;
+    this.clearStallWatchdog();
+    clearTimeout(this.seekCommitTimer);
+    clearTimeout(this.seekSafetyTimer);
+    this.seekCommitTimer = null;
+    this.seekSafetyTimer = null;
+    this.isSeeking = false;
+    this.pendingResumeTime = 0;
+    this.networkRetryCount = 0;
+    this.stallRecoveryAttempts = 0;
+    this.dropToastShown = false;
+    this.lastProgressTime = 0;
+
     this.currentVideo = videoData;
     
     // Completely hide #app to eliminate background paint overhead & prevent recommendations shining through
@@ -210,7 +380,10 @@ class VideoPlayer {
     this.wakeOSD(4500);
 
     this.titleEl.textContent = videoData.title;
-    this.channelEl.textContent = videoData.author || videoData.ownerId || 'VK Video';
+    const rawAuthor = videoData.author ? String(videoData.author).trim() : '';
+    const isNumericAuthor = /^-?\d+$/.test(rawAuthor);
+    this.channelEl.textContent = (rawAuthor && !isNumericAuthor) ? rawAuthor : 'VK Видео';
+    if (this.timeRemainingEl) this.timeRemainingEl.textContent = '';
     this.qualityBadgeEl.textContent = 'Определение...';
     this.showBuffering(true);
 
@@ -257,6 +430,7 @@ class VideoPlayer {
   }
 
   cleanupEngines() {
+    this.clearStallWatchdog();
     if (this.hls) {
       this.hls.destroy();
       this.hls = null;
@@ -267,18 +441,44 @@ class VideoPlayer {
     }
   }
 
-  async playShaka(manifestUrl, preferredHeight = 2160) {
+  async playShaka(manifestUrl, preferredHeight = 2160, resumeOverride = null) {
     this.cleanupEngines();
+    const sessionId = this.playbackSessionId;
+    const vidId = this.currentVideo ? this.currentVideo.id : null;
+    const isLive = Boolean(this.currentVideo && this.currentVideo.isLive);
+    const resumeTime = resumeOverride !== null ? resumeOverride : this.getValidResumeTime(vidId, isLive);
+    this.pendingResumeTime = resumeTime;
 
     try {
       this.shakaPlayer = new shaka.Player(this.video);
 
-      // Buffer configuration for low memory & smooth playback on LG OLED C1
+      // Safe buffer & retry configuration for LG OLED C1 (avoid bufferBehind: 0 which evicts seeked GOPs!)
       this.shakaPlayer.configure({
         streaming: {
-          bufferingGoal: 6,
+          bufferingGoal: 12,
           rebufferingGoal: 2,
-          bufferBehind: 0
+          bufferBehind: 15,
+          stallEnabled: true,
+          stallThreshold: 1.5,
+          stallSkip: 0.25,
+          retryParameters: {
+            timeout: 15000,
+            maxAttempts: 4,
+            baseDelay: 500,
+            backoffFactor: 1.5
+          }
+        }
+      });
+
+      // Handle async Shaka errors occurring after load (e.g. during post-resume segment download)
+      this.shakaPlayer.addEventListener('error', (event) => {
+        if (sessionId !== this.playbackSessionId) return;
+        const err = event && event.detail ? event.detail : event;
+        console.warn('[Player] Shaka async error:', err);
+        const resumeAt = Math.floor(this.video.currentTime || this.pendingResumeTime || resumeTime || 0);
+        if (this.currentVideo && this.currentVideo.streams && this.currentVideo.streams.hls && window.Hls && Hls.isSupported()) {
+          this.app.showToast('Переключение на HLS поток...');
+          this.playHls(this.currentVideo.streams.hls, isLive, resumeAt);
         }
       });
 
@@ -290,7 +490,9 @@ class VideoPlayer {
         }
       });
 
-      await this.shakaPlayer.load(manifestUrl);
+      // Load manifest directly at saved resumeTime so Shaka fetches target segments immediately
+      await this.shakaPlayer.load(manifestUrl, resumeTime > 0 ? resumeTime : null);
+      if (sessionId !== this.playbackSessionId || !this.shakaPlayer) return;
 
       // Extract unique resolution tracks for quality modal (deduplicate audio pairings)
       const rawTracks = this.shakaPlayer.getVariantTracks();
@@ -309,70 +511,96 @@ class VideoPlayer {
         shakaTrack: t
       })).sort((a, b) => b.height - a.height);
 
-      // Select target quality (4K AV1 by default)
+      // Select target quality (4K AV1 by default) without clearing buffer if already active
       let targetIndex = this.availableLevels.findIndex(t => t.height === preferredHeight);
       if (targetIndex === -1) targetIndex = this.availableLevels.findIndex(t => t.height >= 2160);
       if (targetIndex === -1) targetIndex = 0;
 
       const targetLvl = this.availableLevels[targetIndex];
       if (targetLvl && targetLvl.shakaTrack) {
-        this.shakaPlayer.selectVariantTrack(targetLvl.shakaTrack, true);
+        if (!targetLvl.shakaTrack.active) {
+          this.shakaPlayer.configure({ abr: { enabled: false } });
+          this.shakaPlayer.selectVariantTrack(targetLvl.shakaTrack, true);
+        }
         this.currentLevelIndex = targetIndex;
         const label = targetLvl.height >= 2160 ? '4K 2160p (AV1)' : `${targetLvl.height}p (AV1)`;
         this.qualityBadgeEl.textContent = label;
       }
 
-      // Check for saved resume position
-      const vidId = this.currentVideo ? this.currentVideo.id : null;
-      const isLive = this.currentVideo && this.currentVideo.isLive;
-      const savedTime = this.app.getSavedPosition(vidId);
-      if (savedTime && savedTime > 15 && !isLive) {
-        this.video.currentTime = savedTime;
-        this.app.showToast(`▶ Продолжение с ${this.formatTime(savedTime)}`);
+      if (resumeTime > 0) {
+        if (Math.abs((this.video.currentTime || 0) - resumeTime) > 3) {
+          this.applyResumePosition(resumeTime);
+        }
+        this.app.showToast(`▶ Продолжение с ${this.formatTime(resumeTime)}`);
       } else {
         this.app.showToast(`⚡ Аппаратный 4K AV1 (без рывков) активен`);
       }
 
+      this.scheduleStallWatchdog();
       await this.video.play();
+      if (sessionId !== this.playbackSessionId) return;
       this.isPlaying = true;
       this.updatePlayBtn();
     } catch (err) {
+      if (sessionId !== this.playbackSessionId) return;
       console.warn('[Player] Shaka load failed, falling back to HLS:', err);
       if (this.currentVideo && this.currentVideo.streams && this.currentVideo.streams.hls) {
         this.app.showToast('Переключение на HLS поток...');
-        this.playHls(this.currentVideo.streams.hls);
+        this.playHls(this.currentVideo.streams.hls, isLive, resumeTime);
       }
     }
   }
 
-  playDirect(url, qualityLabel) {
+  playDirect(url, qualityLabel, resumeOverride = null) {
     this.cleanupEngines();
+    const vidId = this.currentVideo ? this.currentVideo.id : null;
+    const isLive = Boolean(this.currentVideo && this.currentVideo.isLive);
+    const resumeTime = resumeOverride !== null ? resumeOverride : this.getValidResumeTime(vidId, isLive);
+
     this.video.src = url;
     this.qualityBadgeEl.textContent = qualityLabel;
+
+    if (resumeTime > 0) {
+      this.applyResumePosition(resumeTime);
+      this.app.showToast(`▶ Продолжение с ${this.formatTime(resumeTime)}`);
+    } else {
+      this.pendingResumeTime = 0;
+    }
+
+    this.scheduleStallWatchdog();
     this.video.play().then(() => {
       this.isPlaying = true;
       this.updatePlayBtn();
-      this.app.showToast(`⚡ Воспроизведение: ${qualityLabel}`);
+      if (resumeTime <= 0) {
+        this.app.showToast(`⚡ Воспроизведение: ${qualityLabel}`);
+      }
     }).catch(err => {
       console.warn('[Player] Direct play error:', err);
     });
   }
 
-  playHls(url, isLive = false) {
+  playHls(url, isLive = false, resumeOverride = null) {
     this.cleanupEngines();
+    const sessionId = this.playbackSessionId;
+    const vidId = this.currentVideo ? this.currentVideo.id : null;
+    const liveFlag = Boolean(isLive || (this.currentVideo && this.currentVideo.isLive));
+    const resumeTime = resumeOverride !== null ? resumeOverride : this.getValidResumeTime(vidId, liveFlag);
+    this.pendingResumeTime = resumeTime;
+    this.networkRetryCount = 0;
 
-    // Configured for smooth 4K hardware playback on LG webOS 6.x
+    // Configured for smooth 4K hardware playback and reliable resume on LG webOS 6.x
     this.hls = new Hls({
       enableWorker: true,
-      lowLatencyMode: isLive,
-      backBufferLength: 0,            // 0s back buffer immediately frees RAM on webOS
-      maxBufferLength: 6,             // 6s forward buffer avoids buffer bloat
-      maxMaxBufferLength: 10,
-      maxBufferSize: 20 * 1024 * 1024,// 20MB RAM ceiling to avoid webOS OOM killer
-      maxBufferHole: 0.2,             // Auto skip tiny PTS gaps on seek
-      highBufferWatchdogPeriod: 1,    // Watchdog to prevent stalls
-      nudgeMaxRetry: 5,               // Fast audio/video sync recovery
-      nudgeOffset: 0.1,
+      lowLatencyMode: liveFlag,
+      backBufferLength: 10,             // Keep 10s back buffer so seeked GOPs aren't evicted mid-decode
+      maxBufferLength: 12,              // 12s forward buffer prevents post-resume starvation
+      maxMaxBufferLength: 20,
+      maxBufferSize: 40 * 1024 * 1024,  // 40MB RAM ceiling for 4K segments without choking
+      maxBufferHole: 0.5,               // Skip tiny PTS gaps cleanly on seek/resume
+      highBufferWatchdogPeriod: 2,      // Watchdog to prevent stalls
+      nudgeMaxRetry: 8,                 // Fast audio/video sync recovery
+      nudgeOffset: 0.2,
+      startPosition: resumeTime > 0 ? resumeTime : -1,
       fragLoadingTimeOut: 20000,
       manifestLoadingTimeOut: 15000,
       fragLoadingMaxRetry: 6,
@@ -387,6 +615,7 @@ class VideoPlayer {
     this.hls.attachMedia(this.video);
 
     this.hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
+      if (sessionId !== this.playbackSessionId) return;
       this.availableLevels = data.levels || [];
       console.log(`[Player] HLS Levels found: ${this.availableLevels.length}`);
 
@@ -414,18 +643,16 @@ class VideoPlayer {
         this.qualityBadgeEl.textContent = 'Auto HD';
       }
 
-      // Check for saved resume position
-      const vidId = this.currentVideo ? this.currentVideo.id : null;
-      const isLive = this.currentVideo && this.currentVideo.isLive;
-      const savedTime = this.app.getSavedPosition(vidId);
-      if (savedTime && savedTime > 15 && !isLive) {
-        this.video.currentTime = savedTime;
-        this.app.showToast(`▶ Продолжение с ${this.formatTime(savedTime)}`);
+      if (resumeTime > 0) {
+        this.applyResumePosition(resumeTime);
+        this.app.showToast(`▶ Продолжение с ${this.formatTime(resumeTime)}`);
       } else {
         this.app.showToast(`⚡ Максимальное качество: ${this.qualityBadgeEl.textContent}`);
       }
 
+      this.scheduleStallWatchdog();
       this.video.play().then(() => {
+        if (sessionId !== this.playbackSessionId) return;
         this.isPlaying = true;
         this.updatePlayBtn();
       }).catch(e => console.warn('[Player] Play promise error:', e));
@@ -451,44 +678,85 @@ class VideoPlayer {
     });
 
     this.hls.on(Hls.Events.ERROR, (event, data) => {
-      console.warn('[Player] Hls Error:', data.type, data.details);
-      if (data.fatal) {
-        switch (data.type) {
-          case Hls.ErrorTypes.NETWORK_ERROR:
-            this.networkRetryCount = (this.networkRetryCount || 0) + 1;
-            if (this.networkRetryCount <= 5) {
-              const delay = Math.min(1000 * Math.pow(1.5, this.networkRetryCount), 6000);
-              this.app.showToast(`Восстановление соединения (${this.networkRetryCount}/5)...`);
-              setTimeout(() => {
-                if (this.hls) this.hls.startLoad();
-              }, delay);
-            } else {
-              this.app.showToast('Ошибка сети. Проверьте подключение');
+      if (sessionId !== this.playbackSessionId) return;
+      console.warn('[Player] Hls Error:', data.type, data.details, 'fatal:', data.fatal);
+
+      // Handle non-fatal buffer stalls that frequently happen after seeking on Chromium 79
+      if (!data.fatal) {
+        if ((data.details === 'bufferStalledError' || data.details === 'bufferNudgeOnStall') && this.video && !this.video.paused) {
+          const now = Date.now();
+          if (now - (this.lastStallNudgeAt || 0) > 2500) {
+            this.lastStallNudgeAt = now;
+            const pos = this.video.currentTime || this.pendingResumeTime || 0;
+            const dur = this.getDuration();
+            if (!dur || pos + 0.25 < dur) {
+              try {
+                this.video.currentTime = pos + 0.2;
+                if (this.hls) this.hls.startLoad(pos + 0.2);
+              } catch (e) {}
             }
-            break;
-          case Hls.ErrorTypes.MEDIA_ERROR:
-            this.hls.recoverMediaError();
-            break;
-          default:
-            this.hls.destroy();
-            this.app.showToast('Сбой потока. Перезапуск...');
-            break;
+          }
         }
+        return;
+      }
+
+      switch (data.type) {
+        case Hls.ErrorTypes.NETWORK_ERROR:
+          // HTTP 403/410 means VK CDN signed URL expired (e.g. after long pause) -> refresh URLs
+          if (data.response && (data.response.code === 403 || data.response.code === 410)) {
+            this.recoverExpiredStream(Math.floor(this.video.currentTime || this.pendingResumeTime || 0));
+            return;
+          }
+          this.networkRetryCount = (this.networkRetryCount || 0) + 1;
+          if (this.networkRetryCount <= 5) {
+            const delay = Math.min(1000 * Math.pow(1.5, this.networkRetryCount), 6000);
+            const retryPos = this.video.currentTime || this.pendingResumeTime || -1;
+            this.app.showToast(`Восстановление соединения (${this.networkRetryCount}/5)...`);
+            setTimeout(() => {
+              if (this.hls && sessionId === this.playbackSessionId) {
+                this.hls.startLoad(retryPos > 0 ? retryPos : -1);
+              }
+            }, delay);
+          } else {
+            this.recoverExpiredStream(Math.floor(this.video.currentTime || this.pendingResumeTime || 0));
+          }
+          break;
+        case Hls.ErrorTypes.MEDIA_ERROR:
+          this.hls.recoverMediaError();
+          break;
+        default:
+          this.hls.destroy();
+          this.hls = null;
+          this.recoverExpiredStream(Math.floor(this.video.currentTime || this.pendingResumeTime || 0));
+          break;
       }
     });
   }
 
   togglePlay() {
     if (this.video.paused) {
+      if (this.video.error) {
+        this.recoverExpiredStream(Math.floor(this.video.currentTime || this.pendingResumeTime || 0));
+        return;
+      }
+      // If buffer was evicted during a long pause, kick-start fragment loading on HLS
+      if (this.hls && (!this.video.buffered || this.video.buffered.length === 0)) {
+        try {
+          this.hls.startLoad(this.video.currentTime || -1);
+        } catch (e) {}
+      }
+      this.scheduleStallWatchdog();
       this.video.play().then(() => {
         this.isPlaying = true;
         this.updatePlayBtn();
         this.wakeOSD(3000);
         this.app.showToast('▶ Воспроизведение');
       }).catch(err => {
-        console.warn('[Player] play error:', err);
+        console.warn('[Player] play error, trying stream recovery:', err);
+        this.recoverExpiredStream(Math.floor(this.video.currentTime || this.pendingResumeTime || 0));
       });
     } else {
+      this.clearStallWatchdog();
       this.video.pause();
       this.isPlaying = false;
       this.updatePlayBtn();
@@ -579,6 +847,7 @@ class VideoPlayer {
     if (this.currentVideo && this.currentVideo.isLive) {
       this.timeCurrentEl.textContent = '🔴 LIVE';
       this.timeTotalEl.textContent = 'В ЭФИРЕ';
+      if (this.timeRemainingEl) this.timeRemainingEl.textContent = '';
       this.progressBar.style.width = '100%';
       this.thumb.style.left = '100%';
       return;
@@ -586,12 +855,25 @@ class VideoPlayer {
 
     const cur = this.video.currentTime || 0;
     const dur = this.getDuration() || 1;
+    const remainingSec = Math.max(0, dur - cur);
+
+    // Progress actually moved -> clear buffering spinner & stall watchdog
+    if (Math.abs(cur - (this.lastProgressTime || 0)) > 0.2) {
+      this.lastProgressTime = cur;
+      this.showBuffering(false);
+      this.clearStallWatchdog();
+      this.stallRecoveryAttempts = 0;
+    }
+
     const pct = Math.max(0, Math.min(100, (cur / dur) * 100));
 
     this.progressBar.style.width = `${pct}%`;
     this.thumb.style.left = `${pct}%`;
     this.timeCurrentEl.textContent = this.formatTime(cur);
     this.timeTotalEl.textContent = this.formatTime(dur);
+    if (this.timeRemainingEl) {
+      this.timeRemainingEl.textContent = dur > 1 ? `(-${this.formatTime(remainingSec)})` : '';
+    }
 
     // Buffer track
     if (this.video.buffered && this.video.buffered.length > 0) {
@@ -610,6 +892,15 @@ class VideoPlayer {
       }
     }
 
+    // Protect saved resume position from being overwritten by early pre-seek timeupdate frames
+    if (this.pendingResumeTime > 0) {
+      if (Math.abs(cur - this.pendingResumeTime) <= 10) {
+        this.pendingResumeTime = 0;
+      } else {
+        return;
+      }
+    }
+
     // Periodically save watch progress for resume
     if (this.currentVideo && cur > 5 && dur > 10) {
       this.app.saveWatchProgress(this.currentVideo.id, cur, dur);
@@ -621,6 +912,7 @@ class VideoPlayer {
   }
 
   onEnded() {
+    this.clearStallWatchdog();
     this.isPlaying = false;
     this.updatePlayBtn();
     this.wakeOSD();
@@ -630,6 +922,7 @@ class VideoPlayer {
   onError(e) {
     console.error('[Player] Video element error:', e);
     this.showBuffering(false);
+    this.clearStallWatchdog();
   }
 
   formatTime(seconds) {
@@ -670,8 +963,16 @@ class VideoPlayer {
   }
 
   close() {
+    this.playbackSessionId++;
     this.stopPowerKeepAlive();
     clearTimeout(this.osdTimeout);
+    clearTimeout(this.seekCommitTimer);
+    clearTimeout(this.seekSafetyTimer);
+    this.seekCommitTimer = null;
+    this.seekSafetyTimer = null;
+    this.isSeeking = false;
+    this.pendingResumeTime = 0;
+    this.stallRecoveryAttempts = 0;
     this.cleanupEngines();
     this.video.pause();
     this.video.removeAttribute('src');

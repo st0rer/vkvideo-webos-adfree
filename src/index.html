@@ -113,13 +113,16 @@
       <!-- Bottom Controls -->
       <div class="osd-bottom">
         <div class="progress-container">
-          <span class="progress-time" id="time-current">0:00</span>
+          <span class="progress-time progress-time-left" id="time-current">0:00</span>
           <div class="progress-track focusable" id="progress-track" tabindex="0">
             <div class="progress-buffered" id="progress-buffered"></div>
             <div class="progress-played" id="progress-played"></div>
             <div class="progress-thumb" id="progress-thumb"></div>
           </div>
-          <span class="progress-time" id="time-total">0:00</span>
+          <div class="progress-time-right-group">
+            <span class="progress-time" id="time-total">0:00</span>
+            <span class="progress-remaining" id="time-remaining"></span>
+          </div>
         </div>
 
         <div class="controls-bar">
