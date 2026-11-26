@@ -48,6 +48,7 @@ html, body {
   height: 1080px;
   overflow: hidden;
   background-color: var(--bg-color);
+  background-image: radial-gradient(ellipse at 72% -10%, rgba(0, 119, 255, 0.11) 0%, transparent 56%);
   color: var(--text-main);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   font-size: 22px;
@@ -70,13 +71,13 @@ html, body {
   left: 0;
   width: 100px; /* Collapsed width by default */
   height: 1080px;
-  background-color: var(--sidebar-bg);
+  background: linear-gradient(180deg, #131924 0%, #0d1118 100%);
   border-right: 1px solid rgba(255, 255, 255, 0.08);
   display: flex;
   flex-direction: column;
   padding: 30px 14px;
   z-index: 100;
-  box-shadow: 12px 0 40px rgba(0, 0, 0, 0.7);
+  box-shadow: 12px 0 40px rgba(0, 0, 0, 0.75);
   transition: width 0.28s cubic-bezier(0.2, 0.9, 0.3, 1);
   overflow: hidden;
   white-space: nowrap;
@@ -184,7 +185,7 @@ html, body {
 
 .nav-item.active {
   color: #ffffff;
-  background: rgba(0, 119, 255, 0.18);
+  background: linear-gradient(90deg, rgba(0, 119, 255, 0.24) 0%, rgba(0, 119, 255, 0.06) 100%);
   font-weight: 600;
 }
 
@@ -192,11 +193,12 @@ html, body {
   content: "";
   position: absolute;
   left: 0;
-  top: 15%;
-  height: 70%;
+  top: 18%;
+  height: 64%;
   width: 5px;
   background: var(--accent-color);
   border-radius: 0 5px 5px 0;
+  box-shadow: 0 0 12px rgba(0, 119, 255, 0.65);
 }
 
 .sidebar-footer {
@@ -279,8 +281,10 @@ html, body {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 10px;
-  margin-bottom: 18px;
+  gap: 8px;
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
   flex-shrink: 0;
 }
 
@@ -550,12 +554,13 @@ html, body {
 /* High-Contrast 10-Foot UI Focus States */
 .video-card.focused,
 .video-card:focus {
-  outline: 4px solid #ffffff !important;
-  outline-offset: 4px !important;
-  transform: scale(1.06) translateY(-4px) !important;
+  outline: 3.5px solid #ffffff !important;
+  outline-offset: 3px !important;
+  transform: scale(1.045) translateY(-3px) !important;
   z-index: 25 !important;
-  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.8), 0 0 30px var(--accent-glow) !important;
-  border-color: #ffffff !important;
+  background: #1d2432 !important;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.85), 0 0 24px rgba(0, 119, 255, 0.55) !important;
+  border-color: rgba(255, 255, 255, 0.9) !important;
 }
 
 .shelf-row .video-card.focused {
@@ -590,8 +595,8 @@ html, body {
 
 /* Video Card */
 .video-card {
-  background: var(--card-bg);
-  border-radius: 18px;
+  background: #141923;
+  border-radius: 16px;
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -599,7 +604,8 @@ html, body {
   transition: transform 0.22s cubic-bezier(0.2, 0.9, 0.3, 1), box-shadow 0.22s ease, outline 0.16s ease;
   position: relative;
   will-change: transform;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
   contain: layout paint;
 }
 
@@ -672,26 +678,27 @@ html, body {
 
 .badge-overlay-rec {
   position: static;
-  background: rgba(28, 16, 42, 0.94);
-  border: 1.5px solid #a371f7;
-  color: #d2a8ff;
-  font-size: 13px;
-  font-weight: 800;
+  background: rgba(24, 15, 38, 0.88);
+  border: 1px solid rgba(163, 113, 247, 0.75);
+  color: #d7b4ff;
+  font-size: 12px;
+  font-weight: 700;
   padding: 3px 8px;
   border-radius: 6px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.7);
-  letter-spacing: 0.5px;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.65);
+  letter-spacing: 0.4px;
 }
 
 .duration-badge {
   position: absolute;
-  bottom: 12px;
-  right: 12px;
-  background: rgba(0, 0, 0, 0.88);
+  bottom: 10px;
+  right: 10px;
+  background: rgba(10, 13, 19, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.12);
   color: #ffffff;
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 700;
-  padding: 4px 10px;
+  padding: 4px 9px;
   border-radius: 7px;
 }
 
@@ -702,18 +709,18 @@ html, body {
   left: 0;
   width: 100%;
   height: 5px;
-  background: rgba(255, 255, 255, 0.28);
+  background: rgba(255, 255, 255, 0.24);
   z-index: 5;
 }
 
 .card-progress-fill {
   height: 100%;
-  background: var(--accent-color);
-  box-shadow: 0 0 10px var(--accent-glow);
+  background: linear-gradient(90deg, #0077ff 0%, #38bdf8 100%);
+  box-shadow: 0 0 8px rgba(56, 189, 248, 0.55);
 }
 
 .card-body {
-  padding: 18px 20px;
+  padding: 15px 18px 16px 18px;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -747,7 +754,9 @@ html, body {
 }
 
 .card-author {
-  max-width: 170px;
+  max-width: 175px;
+  color: #aeb9cc;
+  font-weight: 500;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1443,7 +1452,7 @@ html, body {
   gap: 10px;
   max-height: 600px;
   overflow-y: auto;
-  padding: 4px;
+  padding: 8px;
 }
 
 /* Quality Modal 2-Column Grid (all 4K, 2K, 1080p, 720p, 480p, 360p, Auto fit on screen!) */
@@ -1458,7 +1467,7 @@ html, body {
   gap: 12px;
   max-height: 640px;
   overflow-y: auto;
-  padding: 4px;
+  padding: 8px;
 }
 
 #quality-modal .option-btn {
@@ -1547,32 +1556,36 @@ html, body {
   border: 1px solid rgba(0, 119, 255, 0.45);
 }
 
-/* Toast Notifications */
+/* Toast Notifications (centered pill so top-right badges & buttons never overlap) */
 #toast {
   position: absolute;
-  top: 45px;
-  right: 60px;
-  background: rgba(22, 27, 36, 0.96);
-  border: 1px solid rgba(255, 255, 255, 0.22);
+  top: 26px;
+  left: 50%;
+  background: rgba(20, 25, 35, 0.96);
+  border: 1px solid rgba(255, 255, 255, 0.2);
   color: #ffffff;
-  padding: 18px 32px;
-  border-radius: 18px;
-  font-size: 22px;
+  padding: 13px 28px;
+  border-radius: 999px;
+  font-size: 20px;
   font-weight: 600;
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
   box-shadow: 0 12px 35px rgba(0, 0, 0, 0.8);
   z-index: 400;
   opacity: 0;
-  transform: translateY(-20px);
+  transform: translate(-50%, -18px);
   transition: all 0.25s cubic-bezier(0.2, 0.9, 0.3, 1);
   pointer-events: none;
+  max-width: 900px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 #toast.show {
   opacity: 1;
-  transform: translateY(0);
+  transform: translate(-50%, 0);
 }
 
 /* ==========================================================================

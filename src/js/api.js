@@ -13,6 +13,11 @@ class VKApi {
     // Primary API endpoint specifically designed by VK for Smart TVs (Global SSL + CORS)
     this.apiBase = 'https://proxy.vkvideo.ru/api/method';
     this.apiFallback = 'https://api.vk.com/method';
+    this._groupsCache = null;
+    this._groupsCacheTime = 0;
+    this._groupsCacheToken = null;
+    this._groupsCacheMethod = null;
+    this._groupsInFlight = null;
   }
 
   isAuthorized() {
@@ -21,6 +26,10 @@ class VKApi {
 
   setToken(token) {
     this.userToken = token;
+    this._groupsCache = null;
+    this._groupsInFlight = null;
+    this._smartTvContextCache = null;
+    this._smartTvMainSectionId = null;
     try {
       localStorage.setItem('vk_user_token', token);
     } catch (e) {
@@ -30,12 +39,56 @@ class VKApi {
 
   logout() {
     this.userToken = null;
+    this._groupsCache = null;
+    this._groupsInFlight = null;
+    this._smartTvContextCache = null;
+    this._smartTvMainSectionId = null;
     try {
       localStorage.removeItem('vk_user_token');
       localStorage.removeItem('vk_user_info');
     } catch (e) {
       console.warn('[VKApi] localStorage logout error:', e);
     }
+  }
+
+  async getCachedUserGroups(count = 150) {
+    if (!this.isAuthorized()) return { items: [] };
+    const now = Date.now();
+    if (
+      this._groupsCache &&
+      this._groupsCacheToken === this.userToken &&
+      this._groupsCacheMethod === this.callMethod &&
+      (now - (this._groupsCacheTime || 0) < 60000)
+    ) {
+      return this._groupsCache;
+    }
+    if (
+      this._groupsInFlight &&
+      this._groupsCacheToken === this.userToken &&
+      this._groupsCacheMethod === this.callMethod
+    ) {
+      return this._groupsInFlight;
+    }
+    const tokenSnap = this.userToken;
+    const methodSnap = this.callMethod;
+    this._groupsCacheToken = tokenSnap;
+    this._groupsCacheMethod = methodSnap;
+    this._groupsInFlight = this.callMethod('groups.get', {
+      extended: 1,
+      count: Math.max(count, 150),
+      fields: 'photo_200,activity,members_count,verified,description'
+    }).then(resp => {
+      if (this.userToken === tokenSnap && resp && Array.isArray(resp.items)) {
+        this._groupsCache = resp;
+        this._groupsCacheTime = Date.now();
+      }
+      return resp || { items: [] };
+    }).finally(() => {
+      if (this._groupsCacheToken === tokenSnap) {
+        this._groupsInFlight = null;
+      }
+    });
+    return this._groupsInFlight;
   }
 
   async getValidToken() {
@@ -1517,32 +1570,43 @@ class VKApi {
       !forceRefresh &&
       this._smartTvContextCache &&
       this._smartTvContextToken === this.userToken &&
-      (nowMs - (this._smartTvContextCacheTime || 0) < 45000)
+      (nowMs - (this._smartTvContextCacheTime || 0) < 90000)
     ) {
       return this._smartTvContextCache;
     }
 
     try {
-      const smartResp = await this.callMethod('catalog.getVideoSmartTV', {
-        need_stub_blocks: 1,
-        ref: 'main'
-      }).catch(() => null);
+      let mainSectionId = this._smartTvMainSectionId && this._smartTvContextToken === this.userToken
+        ? this._smartTvMainSectionId
+        : null;
 
-      const sections = (smartResp && smartResp.catalog && Array.isArray(smartResp.catalog.sections))
-        ? smartResp.catalog.sections
-        : [];
-      if (sections.length === 0) return empty;
+      if (!mainSectionId) {
+        const smartResp = await this.callMethod('catalog.getVideoSmartTV', {
+          need_stub_blocks: 1,
+          ref: 'main'
+        }).catch(() => null);
 
-      const mainSec = sections.find(s => s && (s.url === 'https://vkvideo.ru' || s.title === 'Главная')) || sections[1] || sections[0];
-      if (!mainSec || !mainSec.id) return empty;
+        const sections = (smartResp && smartResp.catalog && Array.isArray(smartResp.catalog.sections))
+          ? smartResp.catalog.sections
+          : [];
+        if (sections.length === 0) return empty;
 
-      const linksResp = await this.callMethod('catalog.getSectionBlocksLinks', {
-        section_id: mainSec.id,
+        const mainSec = sections.find(s => s && (s.url === 'https://vkvideo.ru' || s.title === 'Главная')) || sections[1] || sections[0];
+        if (!mainSec || !mainSec.id) return empty;
+        mainSectionId = mainSec.id;
+        this._smartTvMainSectionId = mainSectionId;
+      }
+
+      let linksResp = await this.callMethod('catalog.getSectionBlocksLinks', {
+        section_id: mainSectionId,
         need_first_block_data: 1,
         count: 20
       }).catch(() => null);
 
-      if (!linksResp) return empty;
+      if (!linksResp) {
+        this._smartTvMainSectionId = null;
+        return empty;
+      }
 
       // 1. Personal server feed ("Все" first block)
       let personalFeedVideos = [];
@@ -1749,7 +1813,7 @@ class VKApi {
       const seeds = this.extractRecommendationSeeds(localHistory);
 
       // 3. Parallel fetch: Native VK Video Discover + Premier creator channels + Semantic searches on user seeds
-      const discoverPromise = this.getVideoDiscoverRecommendations(localHistory, excludedIds, 8).catch(() => []);
+      const discoverPromise = this.getVideoDiscoverRecommendations(localHistory, excludedIds, 8, 2).catch(() => []);
 
       // A. Top Premier Popular Channels (Ida Galich, Shastun, Vpiska, Azamat, Natalnaya Karta, Minaev Live, etc.)
       const premierChannels = this.getPremierPopularChannels();
@@ -1775,12 +1839,12 @@ class VKApi {
         }
       }
 
-      const premierPromises = targetChannels.slice(0, 8).map(ch =>
+      const premierPromises = targetChannels.slice(0, 6).map(ch =>
         this.getChannelVideos(ch.id, 6, ch.name, 240).catch(() => [])
       );
 
       // B. Semantic seed searches from user history (for personalized affinity discovery)
-      const seedPromises = seeds.slice(0, 4).map(seed =>
+      const seedPromises = seeds.slice(0, 3).map(seed =>
         this.callMethod('video.search', {
           q: seed,
           count: 8,
@@ -2395,11 +2459,7 @@ class VKApi {
     try {
       // 1. Fetch user channels/groups, fave pages, and SmartTV server context (watch history + personal feed) in parallel
       const [topChannelsResp, faveResp, serverCtx] = await Promise.all([
-        this.callMethod('groups.get', {
-          extended: 1,
-          count: 150,
-          fields: 'activity,members_count,verified,description'
-        }),
+        this.getCachedUserGroups(150),
         this.callMethod('fave.getPages', {
           type: 'groups',
           count: 50
@@ -2485,9 +2545,9 @@ class VKApi {
         return scoreB - scoreA;
       });
 
-      // 2. Concurrently fetch fresh full videos from top 28 channels AND smart personalized recommendations
+      // 2. Concurrently fetch fresh full videos from top 20 channels AND smart personalized recommendations
       // Using minDuration = 240s (4 minutes) to strictly eliminate short clips, teasers, and looping videos
-      const topChannelsToQuery = rankedChannels.slice(0, 28);
+      const topChannelsToQuery = rankedChannels.slice(0, 20);
       const channelPromises = topChannelsToQuery.map(ch =>
         this.getChannelVideos(-ch.id, 10, ch.name, 240).catch(() => [])
       );
@@ -2672,11 +2732,7 @@ class VKApi {
       }
 
       const [topChannelsResp, serverCtx] = await Promise.all([
-        this.callMethod('groups.get', {
-          extended: 1,
-          count: 150,
-          fields: 'activity,members_count,verified,description'
-        }).catch(() => ({ items: [] })),
+        this.getCachedUserGroups(150).catch(() => ({ items: [] })),
         this.getSmartTVServerContext(false, 20).catch(() => ({ watchHistory: [], personalFeedVideos: [], serverProgress: {} }))
       ]);
 
@@ -2906,15 +2962,11 @@ class VKApi {
     if (!this.isAuthorized()) return [];
 
     try {
-      const resp = await this.callMethod('groups.get', {
-        extended: 1,
-        count: count,
-        fields: 'photo_200,description,members_count'
-      });
+      const resp = await this.getCachedUserGroups(Math.max(count, 150));
 
       if (!resp || !resp.items) return [];
 
-      return resp.items.map(g => ({
+      return resp.items.slice(0, count).map(g => ({
         id: -Math.abs(g.id),
         name: g.name || 'Канал',
         avatar: g.photo_200 || g.photo_100 || 'assets/icon.png',
@@ -2930,18 +2982,13 @@ class VKApi {
   /**
    * Get Pure Subscriptions Video Feed:
    * Strictly full-length horizontal videos from channels the user is subscribed to (NO external recommendations, NO shorts)
-   * 4x expanded pool: up to 80 channels and 160 fresh uploads
-   * Sorted chronologically (newest uploads first)
+   * Sorted chronologically (newest uploads first), supports channelOffset paging for smooth early prefetch.
    */
-  async getUserSubscriptionsFeed(count = 160, minDuration = 240) {
+  async getUserSubscriptionsFeed(count = 160, minDuration = 240, channelOffset = 0) {
     if (!this.isAuthorized()) return [];
 
     try {
-      const resp = await this.callMethod('groups.get', {
-        extended: 1,
-        count: 150,
-        fields: 'photo_200,description,members_count,verified,activity'
-      });
+      const resp = await this.getCachedUserGroups(150);
 
       const stopWords = [
         'администрация', 'муниципал', 'оханск', 'мбоу', 'сош', 'дума',
@@ -2973,8 +3020,9 @@ class VKApi {
         return scoreB - scoreA;
       });
 
-      // 4x expanded pool: up to 80 channels with 12 videos each
-      const topChannels = ranked.slice(0, 80);
+      // Fast batching: up to 24 channels per page (next tiers load dynamically on scroll)
+      const topChannels = ranked.slice(channelOffset, channelOffset + 24);
+      if (topChannels.length === 0) return [];
       const channelResults = await Promise.all(
         topChannels.map(ch => this.getChannelVideos(-ch.id, 12, ch.name, minDuration).catch(() => []))
       );

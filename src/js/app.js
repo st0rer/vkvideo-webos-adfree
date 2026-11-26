@@ -178,9 +178,13 @@ class VKVideoApp {
     // 4. Invalidate feed caches
     this.homeFeedCache = null;
     this.homeFeedCacheTime = 0;
+    this._prefetchedHomeBatch = null;
+    this._prefetchHomePromise = null;
     this.subsFeedCache = null;
     this.subsChannelsCache = null;
     this.subsCacheTime = 0;
+    this._prefetchedSubsBatch = null;
+    this._prefetchSubsPromise = null;
     this.userSubscribedIds = new Set();
   }
 
@@ -586,9 +590,12 @@ class VKVideoApp {
   }
 
   async renderHome() {
-    this.homeFeedOffset = 192;
+    this.homeFeedOffset = 96;
     this.isLoadingMoreHome = false;
     this.hasMoreHomeVideos = true;
+    this._prefetchedHomeBatch = null;
+    this._prefetchHomePromise = null;
+    clearTimeout(this._homePrefetchTimer);
     this.initThumbnailObserver();
 
     const content = document.getElementById('main-content');
@@ -642,8 +649,10 @@ class VKVideoApp {
     let hasRenderedCache = false;
     if (cachedVideos && cachedVideos.length >= (isAuth ? 12 : 6)) {
       this.homeFeedCache = cachedVideos;
+      this.homeFeedOffset = cachedVideos.length;
       this.renderVideoCards(grid, cachedVideos);
       this.focusCurrentSection();
+      this.scheduleHomePrefetch();
       hasRenderedCache = true;
     } else {
       this.renderSkeletons(grid, 8);
@@ -657,7 +666,7 @@ class VKVideoApp {
       try {
         let freshVideos = [];
         if (isAuth) {
-          freshVideos = await this.api.getSmartFeed(192, this.history, this.watchProgress);
+          freshVideos = await this.api.getSmartFeed(96, this.history, this.watchProgress);
         } else {
           freshVideos = await this.api.getTrending(48);
         }
@@ -683,8 +692,10 @@ class VKVideoApp {
 
           this.homeFeedCache = freshVideos;
           this.homeFeedCacheTime = Date.now();
+          this._prefetchedHomeBatch = null;
+          this._prefetchHomePromise = null;
           try {
-            localStorage.setItem(cacheKey, JSON.stringify(freshVideos.slice(0, 120)));
+            localStorage.setItem(cacheKey, JSON.stringify(freshVideos.slice(0, 96)));
           } catch (e) {}
 
           if (this.currentSection === 'home') {
@@ -692,6 +703,7 @@ class VKVideoApp {
             const modalOrPlayerActive = this.isModalOpen() || (this.player && this.player.container.style.display !== 'none');
             if (!hasRenderedCache || (!userScrolled && !modalOrPlayerActive)) {
               const prevFocusedId = (this.nav && this.nav.currentFocused && this.nav.currentFocused.dataset) ? this.nav.currentFocused.dataset.id : null;
+              this.homeFeedOffset = freshVideos.length;
               grid.innerHTML = '';
               this.renderVideoCards(grid, freshVideos);
               if (prevFocusedId) {
@@ -702,6 +714,7 @@ class VKVideoApp {
                 this.focusCurrentSection();
               }
             }
+            this.scheduleHomePrefetch();
           }
         }
       } catch (err) {
@@ -783,6 +796,18 @@ class VKVideoApp {
     const channelsRow = document.getElementById('subs-channels-row');
     const feedGrid = document.getElementById('subs-feed-grid');
     const userSuffix = this.activeUserId ? `user_${this.activeUserId}` : 'guest';
+    this.subsChannelOffset = 24;
+    this.isLoadingMoreSubs = false;
+    this.hasMoreSubsVideos = true;
+    this._prefetchedSubsBatch = null;
+    this._prefetchSubsPromise = null;
+    clearTimeout(this._subsPrefetchTimer);
+
+    if (feedGrid) {
+      feedGrid.addEventListener('scroll', () => {
+        this.onGridScrolled(feedGrid);
+      }, { passive: true });
+    }
 
     // 1. Instant Cache Render (Stale-While-Revalidate: 0 ms)
     let cachedChannels = this.subsChannelsCache;
@@ -818,7 +843,7 @@ class VKVideoApp {
       try {
         const [channels, feedVideos] = await Promise.all([
           this.api.getUserSubscriptions(80),
-          this.api.getUserSubscriptionsFeed(160, 240)
+          this.api.getUserSubscriptionsFeed(120, 240, 0)
         ]);
 
         if (channels && channels.length > 0) {
@@ -832,6 +857,8 @@ class VKVideoApp {
         this.subsChannelsCache = channels;
         this.subsFeedCache = feedVideos;
         this.subsCacheTime = Date.now();
+        this.subsChannelOffset = 24;
+        this.hasMoreSubsVideos = Array.isArray(channels) && channels.length > 24;
         try {
           localStorage.setItem(`vk_subs_channels_cache_${userSuffix}`, JSON.stringify(channels));
           localStorage.setItem(`vk_subs_feed_cache_${userSuffix}`, JSON.stringify(feedVideos));
@@ -850,6 +877,7 @@ class VKVideoApp {
             }
             this.focusCurrentSection();
           }
+          if (this.hasMoreSubsVideos) this.scheduleSubsPrefetch();
         }
       } catch (err) {
         console.error('[App] Subscriptions load error:', err);
@@ -1460,7 +1488,7 @@ class VKVideoApp {
         }
       }, {
         root: null,
-        rootMargin: '1400px 0px 1400px 0px'
+        rootMargin: '1400px 0px 2400px 0px'
       });
     }
   }
@@ -1666,10 +1694,11 @@ class VKVideoApp {
   }
 
   onElementFocused(element) {
-    if (!element || this.currentSection !== 'home') return;
-    if (this.isLoadingMoreHome || !this.hasMoreHomeVideos) return;
+    if (!element || !element.classList || !element.classList.contains('video-card')) return;
 
-    if (element.classList && element.classList.contains('video-card')) {
+    if (this.currentSection === 'home') {
+      if (this.isLoadingMoreHome || !this.hasMoreHomeVideos) return;
+
       // Check shelves in home showcase
       const shelves = document.querySelectorAll('.shelf-container');
       if (shelves.length > 0) {
@@ -1679,13 +1708,23 @@ class VKVideoApp {
         }
       }
 
-      // Check legacy/fallback grid if present
+      // Check grid early (8 rows = 32 cards before the end) so next batch lands before user reaches bottom
       const grid = document.getElementById('video-grid');
       if (grid) {
         const allCards = grid.querySelectorAll('.video-card');
         const idx = Array.prototype.indexOf.call(allCards, element);
-        if (idx >= allCards.length - 12) {
+        if (idx >= Math.max(8, allCards.length - 32)) {
           this.loadMoreHomeFeed();
+        }
+      }
+    } else if (this.currentSection === 'subscriptions') {
+      if (this.isLoadingMoreSubs || !this.hasMoreSubsVideos) return;
+      const feedGrid = document.getElementById('subs-feed-grid');
+      if (feedGrid && feedGrid.contains(element)) {
+        const allCards = feedGrid.querySelectorAll('.video-card');
+        const idx = Array.prototype.indexOf.call(allCards, element);
+        if (idx >= Math.max(8, allCards.length - 28)) {
+          this.loadMoreSubscriptionsFeed();
         }
       }
     }
@@ -1752,11 +1791,47 @@ class VKVideoApp {
   }
 
   onGridScrolled(grid) {
-    if (!grid || this.currentSection !== 'home') return;
-    if (this.isLoadingMoreHome || !this.hasMoreHomeVideos) return;
-    if (grid.scrollTop + grid.clientHeight >= grid.scrollHeight - 900) {
+    if (!grid) return;
+    const nearBottom = grid.scrollTop + grid.clientHeight >= grid.scrollHeight - 2200;
+    if (!nearBottom) return;
+    if (this.currentSection === 'home' && !this.isLoadingMoreHome && this.hasMoreHomeVideos) {
       this.loadMoreHomeFeed();
+    } else if (this.currentSection === 'subscriptions' && !this.isLoadingMoreSubs && this.hasMoreSubsVideos) {
+      this.loadMoreSubscriptionsFeed();
     }
+  }
+
+  scheduleHomePrefetch() {
+    clearTimeout(this._homePrefetchTimer);
+    this._homePrefetchTimer = setTimeout(() => {
+      if (this.currentSection === 'home' && this.hasMoreHomeVideos) {
+        this.prefetchNextHomeBatch();
+      }
+    }, 350);
+  }
+
+  prefetchNextHomeBatch() {
+    if (this._prefetchedHomeBatch || this._prefetchHomePromise || !this.hasMoreHomeVideos) {
+      return this._prefetchHomePromise;
+    }
+    const offsetSnap = this.homeFeedOffset || 96;
+    const reqPromise = this.api.getMoreSmartFeedVideos(
+      offsetSnap,
+      48,
+      this.history,
+      this.watchProgress
+    ).then(items => {
+      if (Array.isArray(items) && items.length > 0) {
+        this._prefetchedHomeBatch = { offset: offsetSnap, items };
+      }
+      return items || [];
+    }).catch(() => []).finally(() => {
+      if (this._prefetchHomePromise === reqPromise) {
+        this._prefetchHomePromise = null;
+      }
+    });
+    this._prefetchHomePromise = reqPromise;
+    return reqPromise;
   }
 
   async loadMoreHomeFeed() {
@@ -1769,26 +1844,106 @@ class VKVideoApp {
     }
 
     try {
-      const moreVideos = await this.api.getMoreSmartFeedVideos(
-        this.homeFeedOffset,
-        48,
-        this.history,
-        this.watchProgress
-      );
+      let moreVideos = null;
+      if (this._prefetchedHomeBatch && Array.isArray(this._prefetchedHomeBatch.items)) {
+        moreVideos = this._prefetchedHomeBatch.items;
+        this._prefetchedHomeBatch = null;
+      } else if (this._prefetchHomePromise) {
+        moreVideos = await this._prefetchHomePromise;
+        this._prefetchedHomeBatch = null;
+      } else {
+        moreVideos = await this.api.getMoreSmartFeedVideos(
+          this.homeFeedOffset,
+          48,
+          this.history,
+          this.watchProgress
+        );
+      }
+
+      if (this.currentSection !== 'home') return;
 
       if (moreVideos && moreVideos.length > 0) {
         this.homeFeedOffset += moreVideos.length;
         this.appendVideoCards(grid, moreVideos);
-        // Truly infinite: keep hasMoreHomeVideos true
         this.hasMoreHomeVideos = true;
+        this.scheduleHomePrefetch();
       } else {
-        // Advance offset and keep infinite scroll alive for subsequent scrolling
         this.homeFeedOffset += 24;
       }
     } catch (e) {
       console.warn('[App] loadMoreHomeFeed error:', e);
     } finally {
       this.isLoadingMoreHome = false;
+    }
+  }
+
+  scheduleSubsPrefetch() {
+    clearTimeout(this._subsPrefetchTimer);
+    this._subsPrefetchTimer = setTimeout(() => {
+      if (this.currentSection === 'subscriptions' && this.hasMoreSubsVideos) {
+        this.prefetchNextSubsBatch();
+      }
+    }, 350);
+  }
+
+  prefetchNextSubsBatch() {
+    if (this._prefetchedSubsBatch || this._prefetchSubsPromise || !this.hasMoreSubsVideos) {
+      return this._prefetchSubsPromise;
+    }
+    const chOffset = this.subsChannelOffset || 24;
+    const reqPromise = this.api.getUserSubscriptionsFeed(120, 240, chOffset)
+      .then(items => {
+        if (Array.isArray(items) && items.length > 0) {
+          this._prefetchedSubsBatch = { channelOffset: chOffset, items };
+        }
+        return items || [];
+      })
+      .catch(() => [])
+      .finally(() => {
+        if (this._prefetchSubsPromise === reqPromise) {
+          this._prefetchSubsPromise = null;
+        }
+      });
+    this._prefetchSubsPromise = reqPromise;
+    return reqPromise;
+  }
+
+  async loadMoreSubscriptionsFeed() {
+    if (this.isLoadingMoreSubs || !this.hasMoreSubsVideos || this.currentSection !== 'subscriptions') return;
+    this.isLoadingMoreSubs = true;
+    const feedGrid = document.getElementById('subs-feed-grid');
+    if (!feedGrid) {
+      this.isLoadingMoreSubs = false;
+      return;
+    }
+
+    try {
+      let moreVideos = null;
+      if (this._prefetchedSubsBatch && Array.isArray(this._prefetchedSubsBatch.items)) {
+        moreVideos = this._prefetchedSubsBatch.items;
+        this._prefetchedSubsBatch = null;
+      } else if (this._prefetchSubsPromise) {
+        moreVideos = await this._prefetchSubsPromise;
+        this._prefetchedSubsBatch = null;
+      } else {
+        moreVideos = await this.api.getUserSubscriptionsFeed(120, 240, this.subsChannelOffset || 24);
+      }
+
+      if (this.currentSection !== 'subscriptions') return;
+
+      this.subsChannelOffset = (this.subsChannelOffset || 24) + 24;
+      if (moreVideos && moreVideos.length > 0) {
+        this.appendVideoCards(feedGrid, moreVideos);
+        const totalChannels = Array.isArray(this.subsChannelsCache) ? this.subsChannelsCache.length : 0;
+        this.hasMoreSubsVideos = totalChannels > this.subsChannelOffset;
+        if (this.hasMoreSubsVideos) this.scheduleSubsPrefetch();
+      } else {
+        this.hasMoreSubsVideos = false;
+      }
+    } catch (e) {
+      console.warn('[App] loadMoreSubscriptionsFeed error:', e);
+    } finally {
+      this.isLoadingMoreSubs = false;
     }
   }
 

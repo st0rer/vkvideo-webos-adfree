@@ -1126,11 +1126,11 @@ test('VKApi - getSmartFeed caps concurrent channel/recommendation requests for f
     title: `Большое шоу комедия выпуск ${i} супер гость`
   }));
 
-  await api.getSmartFeed(192, localHistory, {});
+  await api.getSmartFeed(96, localHistory, {});
   assert.equal(callCounts.blockItemsPages, 1, 'Home getSmartFeed must not wait for 2nd sequential SmartTV history page');
-  assert.ok(callCounts.videoGet <= 36, `Total channel video.get requests must stay bounded (got ${callCounts.videoGet})`);
-  assert.ok(callCounts.discover <= 3, `Discover seed calls must stay bounded (got ${callCounts.discover})`);
-  assert.ok(callCounts.search <= 4, `Semantic search seed calls must stay bounded (got ${callCounts.search})`);
+  assert.ok(callCounts.videoGet <= 28, `Total channel video.get requests must stay bounded (got ${callCounts.videoGet})`);
+  assert.ok(callCounts.discover <= 2, `Discover seed calls must stay bounded (got ${callCounts.discover})`);
+  assert.ok(callCounts.search <= 3, `Semantic search seed calls must stay bounded (got ${callCounts.search})`);
 });
 
 test('VKApi - callMethod does not retry VK rate-limit errors onto fallback api.vk.com', async () => {
@@ -1156,4 +1156,47 @@ test('VKApi - callMethod does not retry VK rate-limit errors onto fallback api.v
   } finally {
     globalThis.fetch = origFetch;
   }
+});
+
+test('VKApi - Subscriptions shares single groups.get call, caps initial batch to 24 channels, and supports paging', async () => {
+  const api = new VKApi();
+  api.setToken('mock_subs_perf');
+  const now = Math.floor(Date.now() / 1000);
+  let groupsGetCalls = 0;
+  const queriedOwners = [];
+
+  const groups = Array.from({ length: 60 }, (_, i) => ({
+    id: 7000 + i,
+    name: `Подписка ${i}`,
+    members_count: 50000 - i,
+    verified: 1
+  }));
+
+  api.callMethod = async (method, params) => {
+    if (method === 'groups.get') {
+      groupsGetCalls++;
+      return { items: groups };
+    }
+    if (method === 'video.get') {
+      queriedOwners.push(params.owner_id);
+      return {
+        items: [{ id: 500 + queriedOwners.length, owner_id: params.owner_id, title: `Ролик канала ${params.owner_id}`, duration: 900, width: 1920, height: 1080, date: now - 100 }]
+      };
+    }
+    return { items: [] };
+  };
+
+  const [channels, page1] = await Promise.all([
+    api.getUserSubscriptions(80),
+    api.getUserSubscriptionsFeed(120, 240, 0)
+  ]);
+
+  assert.equal(channels.length, 60);
+  assert.equal(groupsGetCalls, 1, 'getUserSubscriptions and getUserSubscriptionsFeed must share 1 groups.get call');
+  assert.equal(queriedOwners.length, 24, 'Initial Subscriptions batch must query at most 24 channels');
+  assert.equal(page1.length, 24);
+
+  const page2 = await api.getUserSubscriptionsFeed(120, 240, 24);
+  assert.equal(groupsGetCalls, 1, 'Subsequent paged Subscriptions fetch reuses cached groups.get');
+  assert.equal(page2.length, 24, 'Paged Subscriptions fetch loads next 24 channels');
 });

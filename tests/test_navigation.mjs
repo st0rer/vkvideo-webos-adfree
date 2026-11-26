@@ -246,4 +246,63 @@ describe('Spatial Navigation & LG Remote Tests', () => {
         localEnv.doc.dispatchEvent({ type: 'mouseover', target: bgCard });
         assert.equal(realNav.currentFocused, modalBtn, 'Background mouseover must not steal focus from open modal');
     });
+
+    test('8. Player OK on btn-rewind/btn-forward clicks button while paused, and Left from scrolled grid focuses active nav item', async () => {
+        const localEnv = setupMockEnvironment();
+        await import('../src/js/navigation.js');
+        const SpatialNavigation = globalThis.SpatialNavigation;
+
+        const sidebar = localEnv.doc.getElementById('sidebar');
+        const navHome = new MockElement('div', 'nav-home', 'nav-item focusable active');
+        navHome.setRect(120, 14, 72, 60);
+        const profileBtn = new MockElement('div', 'user-profile-btn', 'user-status-card focusable');
+        profileBtn.setRect(960, 14, 72, 60);
+        sidebar.appendChild(navHome);
+        sidebar.appendChild(profileBtn);
+
+        const mainContent = localEnv.doc.getElementById('main-content');
+        const cardLow = new MockElement('div', 'card-low', 'video-card focusable');
+        cardLow.setRect(880, 176, 380, 260);
+        mainContent.appendChild(cardLow);
+
+        localEnv.root.appendChild(sidebar);
+        localEnv.root.appendChild(mainContent);
+
+        const playerContainer = new MockElement('div', 'player-container');
+        playerContainer.style.display = 'none';
+        const osd = new MockElement('div', 'player-osd');
+        const btnRewind = new MockElement('button', 'btn-rewind', 'player-btn focusable');
+        let rewindClicked = 0;
+        btnRewind.addEventListener('click', () => { rewindClicked++; });
+        playerContainer.appendChild(osd);
+        playerContainer.appendChild(btnRewind);
+
+        let togglePlayCalled = 0;
+        const mockApp = {
+            currentSection: 'home',
+            isModalOpen: () => false,
+            player: {
+                container: playerContainer,
+                osd,
+                playBtn: btnRewind,
+                isSeeking: false,
+                seekCommitTimer: null,
+                video: { paused: true },
+                togglePlay: () => { togglePlayCalled++; }
+            }
+        };
+
+        const realNav = new SpatialNavigation(mockApp);
+        // Test 1: Left from bottom card hits active nav item, not bottom profileBtn
+        realNav.setFocus(cardLow, false);
+        realNav.handleKeyDown({ keyCode: 37, preventDefault: () => {} });
+        assert.equal(realNav.currentFocused, navHome, 'Pressing Left from grid must focus active nav item, not user-profile-btn');
+
+        // Test 2: OK on btn-rewind while video is paused triggers rewind click instead of togglePlay
+        playerContainer.style.display = 'block';
+        realNav.setFocus(btnRewind, false);
+        realNav.handleKeyDown({ keyCode: 13, preventDefault: () => {} });
+        assert.equal(rewindClicked, 1, 'OK on btn-rewind while paused must trigger rewind');
+        assert.equal(togglePlayCalled, 0, 'OK on btn-rewind while paused must not call togglePlay');
+    });
 });

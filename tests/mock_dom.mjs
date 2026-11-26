@@ -112,12 +112,26 @@ export class MockElement {
   }
 
   querySelectorAll(selector) {
+    const parts = selector.trim().split(/\s+/);
+    if (parts.length > 1 && parts[0].startsWith('#')) {
+      const scopeId = parts[0].slice(1);
+      const scopeEl = this.id === scopeId ? this : this.querySelectorAll(parts[0])[0];
+      if (!scopeEl) return [];
+      return scopeEl.querySelectorAll(parts.slice(1).join(' '));
+    }
     const results = [];
+    const matchSingle = (el, sel) => {
+      if (sel === '*') return true;
+      if (sel.startsWith('#')) return el.id === sel.slice(1);
+      if (sel.startsWith('.')) {
+        const classes = sel.slice(1).split('.').filter(Boolean);
+        return classes.every(c => el.classList.contains(c));
+      }
+      return el.tagName.toLowerCase() === sel.toLowerCase();
+    };
     const traverse = (el) => {
       for (const child of el.children) {
-        if (selector.startsWith('.') && child.classList.contains(selector.slice(1))) results.push(child);
-        else if (selector.startsWith('#') && child.id === selector.slice(1)) results.push(child);
-        else if (selector === '*' || child.tagName.toLowerCase() === selector.toLowerCase()) results.push(child);
+        if (matchSingle(child, selector)) results.push(child);
         traverse(child);
       }
     };
@@ -159,10 +173,17 @@ export function setupMockEnvironment() {
       return elements.get(id);
     },
     querySelector(sel) {
-      if (sel.startsWith('#')) return this.getElementById(sel.slice(1));
+      if (sel.startsWith('#') && !/\s/.test(sel)) return this.getElementById(sel.slice(1));
+      const all = this.querySelectorAll(sel);
+      if (all.length > 0) return all[0];
       return root.querySelector(sel);
     },
     querySelectorAll(sel) {
+      const parts = sel.trim().split(/\s+/);
+      if (parts.length > 1 && parts[0].startsWith('#')) {
+        const scope = elements.get(parts[0].slice(1)) || (root.id === parts[0].slice(1) ? root : null);
+        if (scope) return scope.querySelectorAll(parts.slice(1).join(' '));
+      }
       return root.querySelectorAll(sel);
     },
     addEventListener(event, handler) {

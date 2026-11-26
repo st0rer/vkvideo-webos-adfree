@@ -163,9 +163,8 @@ class SpatialNavigation {
           return;
         }
         if (player.video.paused) {
-          // If video is paused, pressing OK resumes immediately!
-          // Exception: if user intentionally navigated to Quality, Speed, or Close
-          if (this.currentFocused && ['btn-quality', 'btn-speed', 'btn-close-player'].includes(this.currentFocused.id)) {
+          // If video is paused, pressing OK resumes immediately unless user intentionally focused a utility/seek button
+          if (this.currentFocused && ['btn-quality', 'btn-speed', 'btn-close-player', 'btn-rewind', 'btn-forward'].includes(this.currentFocused.id)) {
             this.currentFocused.click();
           } else {
             player.togglePlay();
@@ -540,6 +539,18 @@ class SpatialNavigation {
     }
 
     if (bestCandidate) {
+      if (
+        key === 37 &&
+        this.currentFocused.closest('#main-content') &&
+        bestCandidate.closest('#sidebar') &&
+        !(this.app && this.app.isModalOpen && this.app.isModalOpen())
+      ) {
+        const activeNav = document.querySelector('#sidebar .nav-item.active') || document.querySelector('#sidebar .nav-item');
+        if (activeNav) {
+          this.setFocus(activeNav);
+          return;
+        }
+      }
       this.setFocus(bestCandidate);
     }
   }
@@ -572,7 +583,29 @@ class SpatialNavigation {
       }
 
       if (scroll) {
-        element.scrollIntoView({ behavior: 'auto', block: 'nearest', inline: 'nearest' });
+        const scroller = element.closest('.video-grid, .modal-options, #quality-options-list, #profiles-list');
+        const horizScroller = element.closest('.channels-carousel, .shelf-row');
+        if (scroller && typeof scroller.scrollTop === 'number' && scroller.clientHeight > 0) {
+          const elRect = element.getBoundingClientRect();
+          const scRect = scroller.getBoundingClientRect();
+          const pad = 22;
+          if (elRect.top < scRect.top + pad) {
+            scroller.scrollTop -= (scRect.top + pad - elRect.top);
+          } else if (elRect.bottom > scRect.bottom - pad) {
+            scroller.scrollTop += (elRect.bottom - (scRect.bottom - pad));
+          }
+        } else if (horizScroller && typeof horizScroller.scrollLeft === 'number' && horizScroller.clientWidth > 0) {
+          const elRect = element.getBoundingClientRect();
+          const scRect = horizScroller.getBoundingClientRect();
+          const pad = 20;
+          if (elRect.left < scRect.left + pad) {
+            horizScroller.scrollLeft -= (scRect.left + pad - elRect.left);
+          } else if (elRect.right > scRect.right - pad) {
+            horizScroller.scrollLeft += (elRect.right - (scRect.right - pad));
+          }
+        } else {
+          element.scrollIntoView({ behavior: 'auto', block: 'nearest', inline: 'nearest' });
+        }
       }
 
       if (this.app && typeof this.app.onElementFocused === 'function') {
